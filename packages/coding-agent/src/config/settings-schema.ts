@@ -1999,7 +1999,8 @@ export const SETTINGS_SCHEMA = {
 				{
 					value: "git-root",
 					label: "Git root commit",
-					description: "Use the first reachable commit hash so all forks of a repository across hosting platforms share memories and storage.",
+					description:
+						"Use the first reachable commit hash so all forks of a repository across hosting platforms share memories and storage.",
 				},
 			],
 		},

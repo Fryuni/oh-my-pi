@@ -143,10 +143,11 @@ export function computeDefaultSessionDir(
 	storage: SessionStorage,
 	sessionsRootOrOptions?: string | SessionDirectoryOptions,
 ): string {
-	const options: SessionDirectoryOptions = typeof sessionsRootOrOptions === 'string'
-	? {sessionsRoot: sessionsRootOrOptions}
-	: sessionsRootOrOptions ?? {};
-	const {sessionsRoot = getSessionsDir(), identifierMode = 'path'} = options;
+	const options: SessionDirectoryOptions =
+		typeof sessionsRootOrOptions === "string"
+			? { sessionsRoot: sessionsRootOrOptions }
+			: (sessionsRootOrOptions ?? {});
+	const { sessionsRoot = getSessionsDir(), identifierMode = "path" } = options;
 	const { encodedDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
 	const identity = resolveWorkspaceStorageIdentity(resolvedCwd, identifierMode, encodedDirName);
 	if (identity.mode === "path") migrateHomeSessionDirs(sessionsRoot);

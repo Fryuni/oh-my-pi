@@ -853,8 +853,11 @@ export class SessionManager {
 		const nextSessionDir =
 			resolvedTargetDir ??
 			(managedRoot
-				? computeDefaultSessionDir(resolvedCwd, this.#storage, managedRoot, this.#workspaceIdentifierMode)
-				: computeDefaultSessionDir(resolvedCwd, this.#storage, undefined, this.#workspaceIdentifierMode));
+				? computeDefaultSessionDir(resolvedCwd, this.#storage, {
+						sessionsRoot: managedRoot,
+						identifierMode: this.#workspaceIdentifierMode,
+					})
+				: computeDefaultSessionDir(resolvedCwd, this.#storage, { identifierMode: this.#workspaceIdentifierMode }));
 
 		let sessionFileExisted = false;
 
@@ -1518,7 +1521,7 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 		mode: WorkspaceIdentifierMode = "path",
 	): string {
-		return computeDefaultSessionDir(cwd, storage, getSessionsDir(agentDir), mode);
+		return computeDefaultSessionDir(cwd, storage, { sessionsRoot: getSessionsDir(agentDir), identifierMode: mode });
 	}
 
 	/**

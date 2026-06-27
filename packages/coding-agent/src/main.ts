@@ -677,7 +677,9 @@ export async function createSessionManager(
 				workspaceIdentifierMode: workspaceMode,
 			});
 		}
-		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir, undefined, workspaceMode);
+		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir, {
+			identifierMode: workspaceMode,
+		});
 		if (!match) {
 			throw new SessionResolutionError(
 				`Session "${forkSource}" not found.`,
@@ -703,7 +705,9 @@ export async function createSessionManager(
 				beforeProjectDirChange,
 			);
 		}
-		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir, undefined, workspaceMode);
+		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir, {
+			identifierMode: workspaceMode,
+		});
 		if (!match) {
 			throw new SessionResolutionError(
 				`Session "${sessionArg}" not found.`,
