@@ -126,6 +126,13 @@ export function resolveManagedSessionRoot(
 	return path.dirname(sessionDir);
 }
 
+export interface SessionDirectoryOptions {
+	/** Root path of the sessions directories. */
+	sessionsRoot?: string;
+	/** Mode to resolve the identifier for the workspace to share storage. */
+	identifierMode?: WorkspaceIdentifierMode;
+}
+
 /**
  * Compute the default session directory for a cwd.
  * Classifies cwd by canonical location so symlink/alias paths resolve to the
@@ -134,11 +141,14 @@ export function resolveManagedSessionRoot(
 export function computeDefaultSessionDir(
 	cwd: string,
 	storage: SessionStorage,
-	sessionsRoot: string = getSessionsDir(),
-	mode: WorkspaceIdentifierMode = "path",
+	sessionsRootOrOptions?: string | SessionDirectoryOptions,
 ): string {
+	const options: SessionDirectoryOptions = typeof sessionsRootOrOptions === 'string'
+	? {sessionsRoot: sessionsRootOrOptions}
+	: sessionsRootOrOptions ?? {};
+	const {sessionsRoot = getSessionsDir(), identifierMode = 'path'} = options;
 	const { encodedDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
-	const identity = resolveWorkspaceStorageIdentity(resolvedCwd, mode, encodedDirName);
+	const identity = resolveWorkspaceStorageIdentity(resolvedCwd, identifierMode, encodedDirName);
 	if (identity.mode === "path") migrateHomeSessionDirs(sessionsRoot);
 	const sessionDir = path.join(sessionsRoot, identity.segment);
 	if (identity.mode === "path") migrateLegacyAbsoluteSessionDir(resolvedCwd, sessionDir, sessionsRoot);

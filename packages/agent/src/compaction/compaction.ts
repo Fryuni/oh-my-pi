@@ -14,12 +14,12 @@ import {
 	type Message,
 	type MessageAttribution,
 	type Model,
-	ProviderHttpError,
 	type SimpleStreamOptions,
 	type Tool,
 	type Usage,
 	withAuth,
 } from "@oh-my-pi/pi-ai";
+import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
@@ -149,6 +149,7 @@ export interface CompactionSettings {
 	strategy?: "context-full" | "handoff" | "shake" | "snapcompact" | "off";
 	thresholdPercent?: number;
 	thresholdTokens?: number;
+	midTurnEnabled?: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
 	autoContinue?: boolean;
@@ -161,6 +162,7 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	strategy: "context-full",
 	thresholdPercent: -1,
 	thresholdTokens: -1,
+	midTurnEnabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 	autoContinue: true,
