@@ -53,6 +53,7 @@ import { reset as resetCapabilities } from "../capability";
 import type { CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
 import { KeybindingsManager } from "../config/keybindings";
+import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import { isSettingsInitialized, onStatusLineSessionAccentChanged, Settings, settings } from "../config/settings";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import type {
@@ -100,7 +101,6 @@ import { STTController, type SttState } from "../stt";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "../system-prompt";
 import { formatTaskId } from "../task/render";
 import type { LspStartupServerInfo } from "../tools";
-import { isImageProviderPreference, setPreferredImageProvider } from "../tools/image-gen";
 import { normalizeLocalScheme } from "../tools/path-utils";
 import { replaceTabs, TRUNCATE_LENGTHS, truncateToWidth } from "../tools/render-utils";
 import { setAutoQaConsentHandler } from "../tools/report-tool-issue";
@@ -112,13 +112,8 @@ import { renderTreeList } from "../tui/tree-list";
 import type { EventBus } from "../utils/event-bus";
 import { getEditorCommand, openInEditor } from "../utils/external-editor";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../utils/session-color";
+import { messageHasDisplayableThinking } from "../utils/thinking-display";
 import { popTerminalTitle, pushTerminalTitle, setSessionTerminalTitle } from "../utils/title-generator";
-import {
-	isSearchProviderId,
-	isSearchProviderPreference,
-	setExcludedSearchProviders,
-	setPreferredSearchProvider,
-} from "../web/search";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import { ChatBlock, type ChatBlockHost } from "./components/chat-block";
@@ -383,6 +378,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	chatContainer: TranscriptContainer;
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
+	todoReminderContainer: Container;
 	todoContainer: Container;
 	subagentContainer: Container;
 	btwContainer: Container;
@@ -413,14 +409,29 @@ export class InteractiveMode implements InteractiveModeContext {
 	#modelCycleClearTimer: NodeJS.Timeout | undefined;
 	todoPhases: TodoPhase[] = [];
 	hideThinkingBlock = false;
+	#sessionsWithDisplayableThinkingContent = new WeakSet<AgentSession>();
+	/** Whether the visible session has produced thinking content the user can reveal. */
+	get hasDisplayableThinkingContent(): boolean {
+		return this.#sessionsWithDisplayableThinkingContent.has(this.viewSession);
+	}
+	/** Record received reasoning content so Ctrl+T can reveal it even when model metadata says thinking is off. */
+	noteDisplayableThinkingContent(message: AgentMessage): boolean {
+		if (this.hasDisplayableThinkingContent || !messageHasDisplayableThinking(message, this.proseOnlyThinking)) {
+			return false;
+		}
+		this.#sessionsWithDisplayableThinkingContent.add(this.viewSession);
+		return true;
+	}
 	/**
-	 * Effective thinking-block visibility: hidden when the user's setting is on
-	 * OR the session thinking level is "off". Some providers (MiniMax, GLM,
-	 * DeepSeek) return thinking blocks even with reasoning disabled; this
-	 * respects the user's intent when they set thinking to "off" (#626).
+	 * Effective thinking-block visibility: hidden when the user's setting is on,
+	 * or while thinking is "off" before the session has actually produced
+	 * displayable thinking content. Some providers return thinking blocks without
+	 * advertising reasoning support, so observed content unlocks the visibility
+	 * toggle.
 	 */
 	get effectiveHideThinkingBlock(): boolean {
-		return this.hideThinkingBlock || (this.viewSession?.thinkingLevel ?? ThinkingLevel.Off) === ThinkingLevel.Off;
+		const thinkingOff = (this.viewSession?.thinkingLevel ?? ThinkingLevel.Off) === ThinkingLevel.Off;
+		return this.hideThinkingBlock || (thinkingOff && !this.hasDisplayableThinkingContent);
 	}
 	proseOnlyThinking = true;
 	compactionQueuedMessages: CompactionQueuedMessage[] = [];
@@ -536,6 +547,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.retryLoader = undefined;
 		}
 		this.statusContainer.clear();
+		this.todoReminderContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.#cancelModelCycleClearTimer();
 		this.modelCycleContainer.clear();
@@ -615,6 +627,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.chatContainer = new TranscriptContainer();
 		this.pendingMessagesContainer = new Container();
 		this.statusContainer = new AnchoredLiveContainer();
+		this.todoReminderContainer = new AnchoredLiveContainer();
 		this.todoContainer = new AnchoredLiveContainer();
 		this.subagentContainer = new AnchoredLiveContainer();
 		this.btwContainer = new AnchoredLiveContainer();
@@ -834,6 +847,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.ui.addChild(this.chatContainer);
 		this.ui.addChild(this.pendingMessagesContainer);
+		this.ui.addChild(this.todoReminderContainer);
 		this.ui.addChild(this.todoContainer);
 		this.ui.addChild(this.subagentContainer);
 		this.ui.addChild(this.btwContainer);
@@ -1037,18 +1051,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			// module-level search/image provider state reflects the destination
 			// project's configuration. Without this, the previous project's
 			// exclusions leak and newly-excluded providers are still used.
-			const excludedWebSearchProviders = settings.get("providers.webSearchExclude");
-			if (Array.isArray(excludedWebSearchProviders)) {
-				setExcludedSearchProviders(excludedWebSearchProviders.filter(isSearchProviderId));
-			}
-			const webSearchProvider = settings.get("providers.webSearch");
-			if (typeof webSearchProvider === "string" && isSearchProviderPreference(webSearchProvider)) {
-				setPreferredSearchProvider(webSearchProvider);
-			}
-			const imageProvider = settings.get("providers.image");
-			if (isImageProviderPreference(imageProvider)) {
-				setPreferredImageProvider(imageProvider);
-			}
+			applyProviderGlobalsFromSettings(settings);
 		}
 		// Re-warm plugin roots, capabilities, slash commands, and the ssh tool so
 		// the next prompt sees everything scoped to the new project directory.
@@ -1417,6 +1420,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			sessionAccent: settings.get("statusLine.sessionAccent"),
 			transparent: settings.get("statusLine.transparent"),
 			segmentOptions: settings.get("statusLine.segmentOptions"),
+			compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 		});
 	}
 
@@ -1478,11 +1482,47 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	rebuildChatFromMessages(): void {
+		// Mid-stream rebuilds (e.g. `/shake`, theme/setting changes that touch the
+		// transcript) replay only committed `state.messages`. The agent's in-flight
+		// `streamMessage` and its still-pending tool calls live OUTSIDE
+		// `state.messages` until `message_end`, so a plain clear+replay detaches
+		// their UI components while keeping the `streamingComponent` / `pendingTools`
+		// references — subsequent `message_update`/`message_end` events would then
+		// update orphaned components that never re-render and the live LLM output
+		// vanishes from the chat (#3656). Snapshot the in-flight components,
+		// clear+replay, then re-append them in their original chat-container order
+		// and restore the `pendingTools` map so streaming routes back into them.
+		const liveComponents: Component[] = [];
+		const livePendingTools = new Map<string, ToolExecutionHandle>();
+		if (this.viewSession?.isStreaming) {
+			const liveSet = new Set<Component>();
+			if (this.streamingComponent) liveSet.add(this.streamingComponent);
+			for (const [id, component] of this.pendingTools) {
+				livePendingTools.set(id, component);
+				liveSet.add(component as unknown as Component);
+			}
+			if (liveSet.size > 0) {
+				for (const child of this.chatContainer.children) {
+					if (liveSet.has(child)) liveComponents.push(child);
+				}
+			}
+		}
 		this.chatContainer.clear();
 		// Live display uses the compacted transcript tail; export/resume callers
 		// can still request the full inline compaction history.
 		const context = this.viewSession.buildTranscriptSessionContext({ collapseCompactedHistory: true });
 		this.renderSessionContext(context);
+		for (const child of liveComponents) {
+			this.chatContainer.addChild(child);
+		}
+		// `renderSessionContext` clears `pendingTools` at start AND end so the
+		// reconstructed historical tool components don't leak into live tracking.
+		// Restore the in-flight entries afterwards so the next streamed tool-call
+		// delta is routed into the preserved component instead of stacking a
+		// duplicate ToolExecutionComponent below it.
+		for (const [id, component] of livePendingTools) {
+			this.pendingTools.set(id, component);
+		}
 		// During the pre-streaming window — after `startPendingSubmission` has
 		// optimistically rendered the user's message but before the user
 		// `message_start` event lands it in `session` entries — any rebuild
@@ -1571,8 +1611,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			}),
 		}));
 		if (!mutated) return;
-		this.todoPhases = next;
 		this.session.setTodoPhases(next);
+		this.setTodos(next);
 	}
 
 	#cancelTodoAutoClearTimer(): void {
@@ -3583,6 +3623,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		sessionContext: SessionContext,
 		options?: { updateFooter?: boolean; populateHistory?: boolean },
 	): void {
+		for (const message of sessionContext.messages) {
+			this.noteDisplayableThinkingContent(message);
+		}
 		this.#uiHelpers.renderSessionContext(sessionContext, options);
 	}
 
@@ -3844,6 +3887,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#selectorController.showSettingsSelector();
 	}
 
+	showAdvisorConfigure(): void {
+		this.#selectorController.showAdvisorConfigure();
+	}
+
 	showHistorySearch(): void {
 		this.#selectorController.showHistorySearch();
 	}
@@ -4029,12 +4076,14 @@ export class InteractiveMode implements InteractiveModeContext {
 				},
 			];
 		}
+		this.todoReminderContainer.clear();
 		this.#syncTodoAutoClearTimer();
 		this.#renderTodoList();
 		this.ui.requestRender();
 	}
 
 	async reloadTodos(): Promise<void> {
+		this.todoReminderContainer.clear();
 		await this.#loadTodoList();
 		this.ui.requestRender();
 	}

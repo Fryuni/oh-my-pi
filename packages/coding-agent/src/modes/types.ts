@@ -96,6 +96,7 @@ export interface InteractiveModeContext {
 	chatContainer: TranscriptContainer;
 	pendingMessagesContainer: Container;
 	statusContainer: Container;
+	todoReminderContainer: Container;
 	todoContainer: Container;
 	subagentContainer: Container;
 	btwContainer: Container;
@@ -121,7 +122,7 @@ export interface InteractiveModeContext {
 	focusParentSession(): Promise<void>;
 	/** Return the view to the main session (delegates to SessionFocusController.unfocus). */
 	unfocusSession(): Promise<void>;
-	/** Clear loader, status/pending containers, streaming state, and pending tools. */
+	/** Clear loader, transient HUD/pending containers, streaming state, and pending tools. */
 	clearTransientSessionUi(): void;
 	settings: Settings;
 	keybindings: KeybindingsManager;
@@ -161,10 +162,14 @@ export interface InteractiveModeContext {
 	hideThinkingBlock: boolean;
 	/**
 	 * Effective thinking-block visibility: true when hidden by user setting OR
-	 * thinking level is "off". Read this in render paths instead of
-	 * {@link hideThinkingBlock} so blocks are auto-hidden when thinking is off.
+	 * thinking level is "off" before the session has produced displayable
+	 * thinking content.
 	 */
 	readonly effectiveHideThinkingBlock: boolean;
+	/** Whether this visible session has produced thinking content the user can reveal. */
+	readonly hasDisplayableThinkingContent: boolean;
+	/** Record a message whose thinking content makes Ctrl+T meaningful even at thinking level "off"; returns true on first observation. */
+	noteDisplayableThinkingContent(message: AgentMessage): boolean;
 	proseOnlyThinking: boolean;
 	compactionQueuedMessages: CompactionQueuedMessage[];
 	pendingTools: Map<string, ToolExecutionHandle>;
@@ -342,6 +347,7 @@ export interface InteractiveModeContext {
 
 	// Selector handling
 	showSettingsSelector(): void;
+	showAdvisorConfigure(): void;
 	showHistorySearch(): void;
 	showExtensionsDashboard(): void;
 	showAgentsDashboard(): void;
