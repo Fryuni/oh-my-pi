@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Improved premium request calculation logic to account for specific model families
+
+## [16.2.6] - 2026-06-29
+
+### Fixed
+
+- Fixed application crashes and Bun aborts on macOS and when parsing large stats session files, including during `omp --smoke-test` runs, by utilizing a more resilient serial parser and lenient line scanner.
+
 ## [16.2.3] - 2026-06-28
 
 ### Added
