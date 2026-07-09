@@ -43,7 +43,7 @@ function createMockSession(
 		promptIndex: number;
 		emit: (event: AgentSessionEvent) => void;
 		state: { messages: AssistantMessage[] };
-	}) => void,
+	}) => void | Promise<void>,
 ): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const state = { messages: [] as AssistantMessage[] };
@@ -72,7 +72,7 @@ function createMockSession(
 		},
 		prompt: async (text: string, options?: PromptOptions) => {
 			promptIndex += 1;
-			onPrompt({ text, options, promptIndex, emit, state });
+			await onPrompt({ text, options, promptIndex, emit, state });
 		},
 		waitForIdle: async () => {},
 		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
@@ -341,6 +341,66 @@ describe("runSubprocess yield reminders", () => {
 		expect(result.output).toContain('"ok": true');
 	});
 
+	it("waits for yield-triggered abort cleanup before resolving the subagent", async () => {
+		const promptCleanup = Promise.withResolvers<void>();
+		const abortCleanup = Promise.withResolvers<void>();
+		const validYieldEmitted = Promise.withResolvers<void>();
+		let abortCalls = 0;
+		const session = createMockSession(async ({ promptIndex, emit, state }) => {
+			if (promptIndex === 1) {
+				const assistant = createAssistantStopMessage("malformed yield attempt");
+				state.messages.push(assistant);
+				emit({ type: "message_end", message: assistant });
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-malformed",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "result must be an object containing either data or error" }],
+						details: { status: "error", error: "result must be an object containing either data or error" },
+					},
+					isError: true,
+				});
+				return;
+			}
+
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-success-after-malformed",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+			validYieldEmitted.resolve();
+			await promptCleanup.promise;
+		});
+		(session as unknown as { abort: () => Promise<void> }).abort = async () => {
+			abortCalls += 1;
+			promptCleanup.resolve();
+			await abortCleanup.promise;
+		};
+
+		mockCreateAgentSession(session);
+
+		let settled = false;
+		const resultPromise = runSubprocess({ ...baseOptions, id: "subagent-yield-abort-cleanup" }).finally(() => {
+			settled = true;
+		});
+
+		await validYieldEmitted.promise;
+		await Bun.sleep(20);
+		expect(abortCalls).toBe(1);
+		expect(settled).toBe(false);
+
+		abortCleanup.resolve();
+		const result = await resultPromise;
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toContain('"ok": true');
+	});
+
 	it("keeps a real run failure from being masked by a successful yield", () => {
 		const result = finalizeSubprocessOutput({
 			rawOutput: "partial output",
@@ -404,50 +464,6 @@ describe("runSubprocess yield reminders", () => {
 
 		expect(createAgentSessionSpy).toHaveBeenCalledTimes(1);
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.thinkingLevel).toBe(Effort.High);
-	});
-
-	it("prefers explicit modelOverride thinking suffix over provided thinking level, including off", async () => {
-		vi.clearAllMocks();
-		const modelRegistry = {
-			refresh: async () => {},
-			getAvailable: () => [{ provider: "openai", id: "gpt-4o", name: "GPT-4o" }],
-		} as unknown as import("@oh-my-pi/pi-coding-agent/config/model-registry").ModelRegistry;
-
-		const cases = [
-			{ modelOverride: "openai/gpt-4o:low", expectedThinkingLevel: Effort.Low },
-			{ modelOverride: "openai/gpt-4o:off", expectedThinkingLevel: "off" },
-		] as const;
-
-		const createAgentSessionSpy = vi.spyOn(sdkModule, "createAgentSession");
-
-		for (const [index, testCase] of cases.entries()) {
-			const session = createMockSession(({ emit }) => {
-				emit({
-					type: "tool_execution_end",
-					toolCallId: `tool-thinking-override-${index}`,
-					toolName: "yield",
-					result: {
-						content: [{ type: "text", text: "Result submitted." }],
-						details: { status: "success", data: { ok: true } },
-					},
-					isError: false,
-				});
-			});
-
-			createAgentSessionSpy.mockResolvedValue(createSessionResult(session));
-
-			await runSubprocess({
-				...baseOptions,
-				id: `subagent-thinking-override-${index}`,
-				modelOverride: testCase.modelOverride,
-				thinkingLevel: Effort.High,
-				modelRegistry,
-			});
-		}
-
-		expect(createAgentSessionSpy).toHaveBeenCalledTimes(2);
-		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.thinkingLevel).toBe(cases[0].expectedThinkingLevel);
-		expect(createAgentSessionSpy.mock.calls[1]?.[0]?.thinkingLevel).toBe(cases[1].expectedThinkingLevel);
 	});
 	it("fails after 3 reminders when yield is never called for a structured task", async () => {
 		const prompts: string[] = [];

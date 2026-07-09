@@ -16,7 +16,9 @@ import {
 	HashlineFilesystem,
 	hashlineEditParamsSchema,
 } from "@oh-my-pi/pi-coding-agent/edit";
+import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { type Type, type } from "arktype";
 
 beforeAll(async () => {
@@ -54,7 +56,7 @@ async function withTempDir(fn: (tempDir: string) => Promise<void>): Promise<void
 	try {
 		await fn(tempDir);
 	} finally {
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await removeWithRetries(tempDir);
 	}
 }
 
@@ -106,6 +108,56 @@ describe("hashline executor", () => {
 			expect(await Bun.file(filePath).text()).toBe("aaa\nbbb\nccc\nbbb\nccc\nNEW");
 			expect(text).not.toContain("Auto-dropped");
 			expect(text).not.toContain("Auto-absorbed");
+		});
+	});
+
+	it("preserves UTF-8 BOM bytes when hashline edits decoded text", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "Program.cs");
+			const source = "using A;\n";
+			await Bun.write(filePath, new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(source)]));
+			const session = makeHashlineSession(tempDir);
+			const sourceTag = recordFullSnapshot(getFileReadCache(session), filePath, source);
+			const input = `${header("Program.cs", sourceTag)}\n${sameLineRange(tag(1, source))}\n${repl("using B;")}\n`;
+
+			await executeHashlineSingle(hashlineExecuteOptions(tempDir, input, undefined, session));
+
+			const bytes = await fs.readFile(filePath);
+			expect(Array.from(bytes.subarray(0, 3))).toEqual([0xef, 0xbb, 0xbf]);
+			expect(new TextDecoder().decode(bytes.subarray(3))).toBe("using B;\n");
+		});
+	});
+
+	it("edits BOM-prefixed notebooks through the virtual cell text", async () => {
+		await withTempDir(async tempDir => {
+			const filePath = path.join(tempDir, "notebook.ipynb");
+			const notebook = {
+				cells: [
+					{
+						cell_type: "markdown",
+						metadata: { keep: true },
+						source: ["# Title\n"],
+					},
+				],
+				metadata: {},
+				nbformat: 4,
+				nbformat_minor: 5,
+			};
+			await Bun.write(
+				filePath,
+				new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(JSON.stringify(notebook))]),
+			);
+			const session = makeHashlineSession(tempDir);
+			const editableText = "# %% [markdown] cell:0\n# Title\n";
+			const sourceTag = recordFullSnapshot(getFileReadCache(session), filePath, editableText);
+			const input = `${header("notebook.ipynb", sourceTag)}\n${sameLineRange(tag(2, "# Title"))}\n${repl("# Updated")}\n`;
+
+			await executeHashlineSingle(hashlineExecuteOptions(tempDir, input, undefined, session));
+
+			const updated = await Bun.file(filePath).json();
+			expect(updated.cells).toHaveLength(1);
+			expect(updated.cells[0].source).toEqual(["# Updated\n"]);
+			expect(updated.cells[0].metadata).toEqual({ keep: true });
 		});
 	});
 
@@ -254,11 +306,7 @@ describe("hashlineEditParamsSchema — payload shape", () => {
 	}
 
 	it("declares only `input` as the model-facing field", () => {
-		// Create an arktype schema that mirrors hashlineEditParamsSchema structure
-		const testSchema = type({
-			input: "string",
-		});
-		const jsonSchema = getJsonSchema(testSchema) as {
+		const jsonSchema = getJsonSchema(hashlineEditParamsSchema) as {
 			properties?: Record<string, unknown>;
 			required?: string[];
 		};
@@ -275,12 +323,11 @@ describe("hashlineEditParamsSchema — payload shape", () => {
 		expect(result.success).toBe(true);
 	});
 
-	it("accepts `_input` as a provider-emitted alias for `input`", () => {
+	it("rejects `_input` as an alias for `input`", () => {
 		const result = arkSafeParse(hashlineEditParamsSchema, {
 			_input: `[x.ts]\nINS.HEAD:\n${repl("x")}`,
 		});
-		expect(result.success).toBe(true);
-		if (result.success) expect(result.data.input).toBe(`[x.ts]\nINS.HEAD:\n${repl("x")}`);
+		expect(result.success).toBe(false);
 	});
 
 	it("still requires `input`", () => {
@@ -474,6 +521,73 @@ describe("hashline — filename+tag path recovery", () => {
 			expect(guardFs.allowTagPathRecovery("file.ts", inside)).toBe(true);
 			// …but a target outside the working tree (sandbox/vault/out-of-tree) is refused.
 			expect(guardFs.allowTagPathRecovery("file.ts", outside)).toBe(false);
+		});
+	});
+
+	it("recovers a bare plan-file name onto the local:// sandbox in plan mode", async () => {
+		await withTempDir(async tempDir => {
+			const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "hashline-plan-art-"));
+			try {
+				const localOptions = { getArtifactsDir: () => artifactsDir, getSessionId: () => "plan-sess" };
+				const session = {
+					cwd: tempDir,
+					settings: Settings.isolated(),
+					getArtifactsDir: localOptions.getArtifactsDir,
+					getSessionId: localOptions.getSessionId,
+					getPlanModeState: () => ({ enabled: true, planFilePath: "local://cfg-module-hygiene-plan.md" }),
+				} as unknown as ToolSession;
+
+				// Simulate `write local://cfg-module-hygiene-plan.md`: the artifact
+				// lives in the session sandbox and its snapshot tag is recorded there.
+				const sandboxAbs = resolveLocalUrlToPath("local://cfg-module-hygiene-plan.md", localOptions);
+				const source = "# Plan\n\n## Context\n- old\n";
+				await Bun.write(sandboxAbs, source);
+				const sourceTag = recordFullSnapshot(getFileReadCache(session), sandboxAbs, source);
+
+				// The model edits by BARE filename. Plan mode would reject that as a
+				// working-tree write, but the snapshot tag rebinds it onto the artifact.
+				const input = `${header("cfg-module-hygiene-plan.md", sourceTag)}\n${sameLineRange(tag(4, "- old"))}\n${repl("- new")}\n`;
+				const result = await executeHashlineSingle(hashlineExecuteOptions(tempDir, input, undefined, session));
+				const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+				expect(await Bun.file(sandboxAbs).text()).toBe("# Plan\n\n## Context\n- new\n");
+				// No stray working-tree file was created at the bare cwd path.
+				expect(await Bun.file(path.join(tempDir, "cfg-module-hygiene-plan.md")).exists()).toBe(false);
+				// The resolved sandbox path is surfaced so the next turn anchors on it.
+				expect(text).toContain("does not exist");
+			} finally {
+				await fs.rm(artifactsDir, { recursive: true, force: true });
+			}
+		});
+	});
+
+	it("still rejects an existing working-tree edit in plan mode after the recovery reorder", async () => {
+		await withTempDir(async tempDir => {
+			const artifactsDir = await fs.mkdtemp(path.join(os.tmpdir(), "hashline-plan-art-"));
+			try {
+				const session = {
+					cwd: tempDir,
+					settings: Settings.isolated(),
+					getArtifactsDir: () => artifactsDir,
+					getSessionId: () => "plan-sess",
+					getPlanModeState: () => ({ enabled: true, planFilePath: "local://x-plan.md" }),
+				} as unknown as ToolSession;
+
+				// An existing working-tree file with a recorded tag: no recovery is
+				// needed, so the (reordered) write gate must still reject it.
+				const wtFile = path.join(tempDir, "real.ts");
+				const source = "a\nb\nc\n";
+				await Bun.write(wtFile, source);
+				const wtTag = recordFullSnapshot(getFileReadCache(session), wtFile, source);
+				const input = `${header("real.ts", wtTag)}\n${sameLineRange(tag(2, "b"))}\n${repl("B")}\n`;
+
+				await expect(
+					executeHashlineSingle(hashlineExecuteOptions(tempDir, input, undefined, session)),
+				).rejects.toThrow(/working tree is read-only/);
+				expect(await Bun.file(wtFile).text()).toBe(source);
+			} finally {
+				await fs.rm(artifactsDir, { recursive: true, force: true });
+			}
 		});
 	});
 });

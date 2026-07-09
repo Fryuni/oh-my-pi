@@ -26,6 +26,7 @@ import type * as PiCodingAgent from "../../index";
 import type { Theme } from "../../modes/theme/theme";
 import type { ReadonlySessionManager } from "../../session/session-manager";
 import type { TodoItem } from "../../tools/todo";
+import type { RecoveredRetryError } from "../shared-events";
 import type * as TypeBox from "../typebox";
 
 /** Alias for clarity */
@@ -126,12 +127,14 @@ export type CustomToolSessionEvent =
 			maxAttempts: number;
 			delayMs: number;
 			errorMessage: string;
+			errorId?: number;
 	  }
 	| {
 			reason: "auto_retry_end";
 			success: boolean;
 			attempt: number;
 			finalError?: string;
+			recoveredErrors?: RecoveredRetryError[];
 	  }
 	| {
 			reason: "ttsr_triggered";

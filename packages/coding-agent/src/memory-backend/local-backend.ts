@@ -2,6 +2,7 @@ import type { Settings } from "../config/settings";
 import {
 	buildMemoryToolDeveloperInstructions,
 	clearMemoryData,
+	clearMemoryToolDeveloperInstructionsCache,
 	enqueueMemoryConsolidation,
 	saveLearnedLesson,
 	startMemoryStartupTask,
@@ -9,13 +10,13 @@ import {
 import type { MemoryBackend, MemoryBackendOperationContext } from "./types";
 
 interface LocalMemoryOperationSession {
-	settings: Settings;
+	settings?: Settings;
 }
 
 interface LocalMemoryOperationContext {
 	agentDir: string;
 	cwd: string;
-	session?: LocalMemoryOperationSession;
+	session?: LocalMemoryOperationSession & { settings: Settings };
 }
 
 /**
@@ -31,11 +32,12 @@ export const localBackend = {
 	start(options) {
 		startMemoryStartupTask(options);
 	},
-	async buildDeveloperInstructions(agentDir, settings) {
-		return buildMemoryToolDeveloperInstructions(agentDir, settings);
+	async buildDeveloperInstructions(agentDir, settings, session) {
+		return buildMemoryToolDeveloperInstructions(agentDir, settings, session);
 	},
 	async clear(agentDir, cwd, session) {
-		const mode = session?.settings.get("workspace.identifier") ?? "path";
+		clearMemoryToolDeveloperInstructionsCache(session);
+		const mode = session?.settings?.get("workspace.identifier") ?? "path";
 		await clearMemoryData(agentDir, cwd, mode);
 	},
 	async enqueue(agentDir, cwd, session) {

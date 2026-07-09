@@ -17,7 +17,7 @@ const REAL_BASH = Bun.env.SHELL?.includes("bash") ? Bun.env.SHELL : "/bin/bash";
 const REAL_ECHO = Bun.which("echo") ?? "/bin/echo";
 
 // `sanitizeSnapshotForBrush` is the snapshot-side mitigation for brush's
-// whitespace-only alias expander (`crates/brush-core-vendored/src/interp.rs:1500`,
+// whitespace-only alias expander (`crates/vendor/brush-core/src/interp.rs:1500`,
 // brush issue reubeno/brush#57). Aliases whose body needs real shell parsing
 // must be dropped or brush turns the first whitespace piece into the command
 // name and the user sees `error: command not found: (alias;` (issue #3234).
@@ -315,4 +315,81 @@ describe("getOrCreateSnapshot", () => {
 		const content = await fs.readFile(snapshotPath!, "utf8");
 		expect(content).toContain(`export __MISE_EXE='${REAL_ECHO}'`);
 	});
+	it("cleans up the empty snapshot file when the shell exits with a non-zero code", async () => {
+		const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-snap-fail-"));
+		const originalTmpDir = process.env.TMPDIR;
+		process.env.TMPDIR = testRoot;
+		try {
+			const fakeShell = path.join(testRoot, "fail-shell.sh");
+			await fs.writeFile(fakeShell, `#!/bin/sh\nexit 1\n`);
+			await fs.chmod(fakeShell, 0o755);
+
+			const env = { ...process.env, HOME: testRoot };
+			const snapshotDir = path.join(testRoot, "omp-shell-snapshots");
+
+			const snapshotPath = await getOrCreateSnapshot(fakeShell, env);
+			expect(snapshotPath).toBeNull();
+
+			// Verify that no snapshot files were left behind in the isolated tmpdir
+			if (existsSync(snapshotDir)) {
+				const files = await fs.readdir(snapshotDir);
+				expect(files).toEqual([]);
+			}
+		} finally {
+			if (originalTmpDir === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = originalTmpDir;
+			await fs.rm(testRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("cleans up the empty snapshot file when the shell fails to spawn", async () => {
+		const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-snap-spawn-fail-"));
+		const originalTmpDir = process.env.TMPDIR;
+		process.env.TMPDIR = testRoot;
+		try {
+			const fakeShell = path.join(testRoot, "does-not-exist-shell");
+
+			const env = { ...process.env, HOME: testRoot };
+			const snapshotDir = path.join(testRoot, "omp-shell-snapshots");
+
+			const snapshotPath = await getOrCreateSnapshot(fakeShell, env);
+			expect(snapshotPath).toBeNull();
+
+			if (existsSync(snapshotDir)) {
+				const files = await fs.readdir(snapshotDir);
+				expect(files).toEqual([]);
+			}
+		} finally {
+			if (originalTmpDir === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = originalTmpDir;
+			await fs.rm(testRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("cleans up the empty snapshot file when the shell execution times out", async () => {
+		const testRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-snap-timeout-"));
+		const originalTmpDir = process.env.TMPDIR;
+		process.env.TMPDIR = testRoot;
+		try {
+			const fakeShell = path.join(testRoot, "timeout-shell.sh");
+			// Sleep longer than SNAPSHOT_TIMEOUT_MS (2000)
+			await fs.writeFile(fakeShell, `#!/bin/sh\nsleep 3\n`);
+			await fs.chmod(fakeShell, 0o755);
+
+			const env = { ...process.env, HOME: testRoot };
+			const snapshotDir = path.join(testRoot, "omp-shell-snapshots");
+
+			const snapshotPath = await getOrCreateSnapshot(fakeShell, env);
+			expect(snapshotPath).toBeNull();
+
+			if (existsSync(snapshotDir)) {
+				const files = await fs.readdir(snapshotDir);
+				expect(files).toEqual([]);
+			}
+		} finally {
+			if (originalTmpDir === undefined) delete process.env.TMPDIR;
+			else process.env.TMPDIR = originalTmpDir;
+			await fs.rm(testRoot, { recursive: true, force: true });
+		}
+	}, 5000); // increase test timeout to 5s to accommodate the 2s snapshot timeout
 });

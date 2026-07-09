@@ -36,6 +36,7 @@ import {
 	resolveOwnedDialectFromEnv,
 } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
+import { isProviderRefusalMessage } from "./replay-policy";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -44,6 +45,7 @@ import type {
 	AgentState,
 	AgentTool,
 	AgentToolContext,
+	AgentTurnEndContext,
 	AsideMessage,
 	StreamFn,
 	ToolCallContext,
@@ -53,10 +55,13 @@ import { isSoftToolRequirement } from "./types";
 import { EventLoopKeepalive } from "./utils/yield";
 
 /**
- * Default convertToLlm: Keep only LLM-compatible messages, convert attachments.
+ * Default convertToLlm: Keep only LLM-compatible replay messages.
  */
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
-	return messages.filter((m): m is Message => m.role === "user" || m.role === "assistant" || m.role === "toolResult");
+	return messages.filter((m): m is Message => {
+		if (m.role === "assistant") return !isProviderRefusalMessage(m);
+		return m.role === "user" || m.role === "toolResult";
+	});
 }
 
 const ANTHROPIC_OUTPUT_BLOCKED_PREFIX = "Output blocked by conten";
@@ -268,6 +273,17 @@ export interface AgentOptions {
 	 */
 	cursorOnToolResult?: CursorToolResultHandler;
 
+	/** Current working directory used by local tool execution. */
+	cwd?: string;
+	/**
+	 * Resolver for the live working directory, re-read on every turn. When set, it
+	 * overrides the static {@link cwd} at config-build time so a session move
+	 * (`/move`, which updates the host's cwd without reconstructing the Agent) is
+	 * reflected in provider options — e.g. GitLab Duo Agent namespace/project
+	 * discovery keys off this cwd's git remote. Falls back to `cwd` when it returns
+	 * `undefined`.
+	 */
+	cwdResolver?: () => string | undefined;
 	/**
 	 * Called after a tool call has been validated and is about to execute.
 	 * See {@link AgentLoopConfig.beforeToolCall} for full semantics.
@@ -304,10 +320,9 @@ export interface AgentPromptOptions {
 	toolChoice?: ToolChoice;
 }
 
-/** Buffered Cursor tool result with text position at time of call */
+/** Buffered Cursor exec-channel tool result waiting to be emitted after the assistant message. */
 interface CursorToolResultEntry {
 	toolResult: ToolResultMessage;
-	textLengthAtCall: number;
 }
 
 export class Agent {
@@ -354,6 +369,9 @@ export class Agent {
 	#getToolContext?: (toolCall?: ToolCallContext) => AgentToolContext | undefined;
 	#cursorExecHandlers?: CursorExecHandlers;
 	#cursorOnToolResult?: CursorToolResultHandler;
+	#cwd?: string;
+	#cwdResolver?: () => string | undefined;
+
 	#runningPrompt?: Promise<void>;
 	#resolveRunningPrompt?: () => void;
 	#kimiApiFormat?: "openai" | "anthropic";
@@ -370,7 +388,7 @@ export class Agent {
 	#onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
-	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<void> | void;
+	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 	#asideMessageProvider?: () => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
@@ -395,6 +413,10 @@ export class Agent {
 	 * UI emission, and tool dispatch. Reassign at any time to swap the implementation.
 	 */
 	transformAssistantMessage?: AgentLoopConfig["transformAssistantMessage"];
+	/**
+	 * Hook that peeks whether interrupting IRC asides are queued for the next boundary.
+	 */
+	hasIrcInterrupts?: AgentLoopConfig["hasIrcInterrupts"];
 
 	constructor(opts: AgentOptions = {}) {
 		this.#state = { ...this.#state, ...opts.initialState };
@@ -429,6 +451,8 @@ export class Agent {
 		this.#getToolContext = opts.getToolContext;
 		this.#cursorExecHandlers = opts.cursorExecHandlers;
 		this.#cursorOnToolResult = opts.cursorOnToolResult;
+		this.#cwd = opts.cwd;
+		this.#cwdResolver = opts.cwdResolver;
 		this.#kimiApiFormat = opts.kimiApiFormat;
 		this.#preferWebsockets = opts.preferWebsockets;
 		this.#transformToolCallArguments = opts.transformToolCallArguments;
@@ -726,7 +750,11 @@ export class Agent {
 	setOnBeforeYield(fn: (() => Promise<void> | void) | undefined): void {
 		this.#onBeforeYield = fn;
 	}
-	setOnTurnEnd(fn: ((messages: AgentMessage[], signal?: AbortSignal) => Promise<void> | void) | undefined): void {
+	setOnTurnEnd(
+		fn:
+			| ((messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void)
+			| undefined,
+	): void {
 		this.#onTurnEnd = fn;
 	}
 
@@ -1068,12 +1096,11 @@ export class Agent {
 								}
 							} catch {}
 						}
-						// Buffer tool result with current text length for correct ordering later.
-						// Cursor executes tools server-side during streaming, so the assistant message
-						// already incorporates results. We buffer here and emit in correct order
-						// when the assistant message ends.
-						const textLength = this.#getAssistantTextLength(this.#state.streamMessage);
-						this.#cursorToolResultBuffer.push({ toolResult: finalMessage, textLengthAtCall: textLength });
+						// Cursor executes tools server-side during streaming. We buffer
+						// each toolResult and emit them right after the assistant message
+						// closes (see `#emitCursorSplitAssistantMessage`), so replay
+						// receives (assistant with interleaved toolCall blocks) → results.
+						this.#cursorToolResultBuffer.push({ toolResult: finalMessage });
 						return finalMessage;
 					}
 				: undefined;
@@ -1129,6 +1156,8 @@ export class Agent {
 			},
 			cursorExecHandlers: this.#cursorExecHandlers,
 			cursorOnToolResult,
+			cwd: this.#cwd,
+			getCwd: this.#cwdResolver,
 			transformToolCallArguments: this.#transformToolCallArguments,
 			intentTracing: this.#intentTracing,
 			pruneToolDescriptions: this.#pruneToolDescriptions,
@@ -1142,8 +1171,9 @@ export class Agent {
 				: undefined,
 			onAssistantMessageEvent: this.#onAssistantMessageEvent,
 			onHarmonyLeak: this.#onHarmonyLeak,
-			onTurnEnd: (messages, signal) => this.#onTurnEnd?.(messages, signal),
+			onTurnEnd: (messages, signal, context) => this.#onTurnEnd?.(messages, signal, context),
 			getToolChoice,
+			getModel: () => this.#state.model ?? model,
 			getReasoning: () => this.#state.thinkingLevel,
 			getDisableReasoning: () => this.#state.disableReasoning,
 			getServiceTier: this.#serviceTierResolver,
@@ -1155,6 +1185,7 @@ export class Agent {
 				return this.#dequeueSteeringMessages();
 			},
 			hasSteeringMessages: () => this.#steeringQueue.length > 0,
+			hasIrcInterrupts: this.hasIrcInterrupts,
 			getFollowUpMessages: async () => this.#dequeueFollowUpMessages(),
 			getAsideMessages: async () => (await this.#asideMessageProvider?.()) ?? [],
 			onBeforeYield: () => this.#onBeforeYield?.(),
@@ -1311,115 +1342,33 @@ export class Agent {
 		}
 	}
 
-	/** Calculate total text length from an assistant message's content blocks */
-	#getAssistantTextLength(message: AgentMessage | null): number {
-		if (message?.role !== "assistant" || !Array.isArray(message.content)) {
-			return 0;
-		}
-		let length = 0;
-		for (const block of message.content) {
-			if (block.type === "text") {
-				length += (block as TextContent).text.length;
-			}
-		}
-		return length;
-	}
-
 	/**
-	 * Emit a Cursor assistant message split around tool results.
-	 * This fixes the ordering issue where tool results appear after the full explanation.
+	 * Emit a Cursor assistant message with buffered exec-channel toolResults.
 	 *
-	 * Output order: Assistant(preamble) -> ToolResults -> Assistant(continuation)
+	 * Since the Cursor provider now synthesizes `toolCall` content blocks at the
+	 * point each exec tool starts (issue #4348), the assistant message content
+	 * already interleaves text/thinking with toolCall blocks in execution order.
+	 * We emit the message as-is and let the buffered toolResults follow — the
+	 * transcript rebuild in `renderSessionContext` pairs them by `toolCallId`.
+	 *
+	 * Historical note: this used to split the assistant message at
+	 * `textLengthAtCall` to interpose toolResults between preamble and
+	 * continuation. That workaround existed because native cursor tools had no
+	 * toolCall blocks; it also copied `preambleText` into every text block on
+	 * multi-text turns, producing duplicated text on replay.
 	 */
 	#emitCursorSplitAssistantMessage(assistantMessage: AssistantMessage): void {
 		const buffer = this.#cursorToolResultBuffer;
 		this.#cursorToolResultBuffer = [];
 
-		if (buffer.length === 0) {
-			// No tool results, emit normally
-			this.#state.streamMessage = null;
-			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
-			return;
-		}
-
-		// Find the split point: minimum text length at first tool call
-		const splitPoint = Math.min(...buffer.map(r => r.textLengthAtCall));
-
-		// Extract text content from assistant message
-		const content = assistantMessage.content;
-		let fullText = "";
-		for (const block of content) {
-			if (block.type === "text") {
-				fullText += block.text;
-			}
-		}
-
-		// If no text or split point is 0 or at/past end, don't split
-		if (fullText.length === 0 || splitPoint <= 0 || splitPoint >= fullText.length) {
-			// Emit assistant message first, then tool results (original behavior but with buffered results)
-			this.#state.streamMessage = null;
-			this.appendMessage(assistantMessage);
-			this.#emit({ type: "message_end", message: assistantMessage });
-
-			// Emit buffered tool results
-			for (const { toolResult } of buffer) {
-				this.#emit({ type: "message_start", message: toolResult });
-				this.appendMessage(toolResult);
-				this.#emit({ type: "message_end", message: toolResult });
-			}
-			return;
-		}
-
-		// Split the text
-		const preambleText = fullText.slice(0, splitPoint);
-		const continuationText = fullText.slice(splitPoint);
-
-		// Create preamble message (text before tools)
-		const preambleContent = content.map(block => {
-			if (block.type === "text") {
-				return { ...block, text: preambleText };
-			}
-			return block;
-		});
-		const preambleMessage: AssistantMessage = {
-			...assistantMessage,
-			content: preambleContent,
-		};
-
-		// Emit preamble
 		this.#state.streamMessage = null;
-		this.appendMessage(preambleMessage);
-		this.#emit({ type: "message_end", message: preambleMessage });
+		this.appendMessage(assistantMessage);
+		this.#emit({ type: "message_end", message: assistantMessage });
 
-		// Emit buffered tool results
 		for (const { toolResult } of buffer) {
 			this.#emit({ type: "message_start", message: toolResult });
 			this.appendMessage(toolResult);
 			this.#emit({ type: "message_end", message: toolResult });
-		}
-
-		// Emit continuation message (text after tools) if non-empty
-		const trimmedContinuation = continuationText.trim();
-		if (trimmedContinuation.length > 0) {
-			// Create continuation message with only text content (no thinking/toolCalls)
-			const continuationContent: TextContent[] = [{ type: "text", text: continuationText }];
-			const continuationMessage: AssistantMessage = {
-				...assistantMessage,
-				content: continuationContent,
-				// Zero out usage for continuation since it's part of same response
-				usage: {
-					input: 0,
-					output: 0,
-					cacheRead: 0,
-					cacheWrite: 0,
-					totalTokens: 0,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-			};
-			this.#emit({ type: "message_start", message: continuationMessage });
-			this.appendMessage(continuationMessage);
-			this.#emit({ type: "message_end", message: continuationMessage });
 		}
 	}
 }

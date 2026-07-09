@@ -1,6 +1,6 @@
 import type { InMemorySnapshotStore } from "@oh-my-pi/hashline";
 import type { AgentTelemetryConfig, AgentTool } from "@oh-my-pi/pi-agent-core";
-import type { FetchImpl, ImageContent, Model, ServiceTier, ToolChoice } from "@oh-my-pi/pi-ai";
+import type { FetchImpl, ImageContent, Model, ServiceTierByFamily, ToolChoice } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AsyncJobManager } from "../async/job-manager";
 import type { Rule } from "../capability/rule";
@@ -39,13 +39,14 @@ import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
-import type { BuiltinToolName } from "./builtin-names";
-import { type CheckpointState, CheckpointTool, RewindTool } from "./checkpoint";
+import { type BuiltinToolName, normalizeToolNames } from "./builtin-names";
+import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
-import { FindTool } from "./find";
 import { GithubTool } from "./gh";
+import { GlobTool } from "./glob";
+import { GrepTool } from "./grep";
 import { InspectImageTool } from "./inspect-image";
 import { IrcTool, isIrcEnabled } from "./irc";
 import { JobTool } from "./job";
@@ -60,7 +61,6 @@ import { ReadTool } from "./read";
 import { createReportToolIssueTool, isAutoQaEnabled } from "./report-tool-issue";
 import { ResolveTool } from "./resolve";
 import { reportFindingTool } from "./review";
-import { SearchTool } from "./search";
 import { SearchToolBm25Tool } from "./search-tool-bm25";
 import { loadSshTool } from "./ssh";
 import { type TodoPhase, TodoTool } from "./todo";
@@ -82,8 +82,9 @@ export * from "./checkpoint";
 export * from "./debug";
 export * from "./eval";
 export * from "./eval-backends";
-export * from "./find";
 export * from "./gh";
+export * from "./glob";
+export * from "./grep";
 export * from "./image-gen";
 export * from "./inspect-image";
 export * from "./irc";
@@ -98,7 +99,6 @@ export * from "./read";
 export * from "./report-tool-issue";
 export * from "./resolve";
 export * from "./review";
-export * from "./search";
 export * from "./search-tool-bm25";
 export * from "./ssh";
 export * from "./todo";
@@ -224,6 +224,10 @@ export interface ToolSession {
 	getAgentId?: () => string | null;
 	/** Look up a registered tool by name (used by the eval js backend's tool bridge). */
 	getToolByName?: (name: string) => AgentTool | undefined;
+	/** Return whether a built-in tool is active in this turn's tool set. */
+	isToolActive?: (name: string) => boolean;
+	/** Update the active built-in tool predicate when a session changes tools mid-run. */
+	setActiveToolNames?: (names: Iterable<string>) => void;
 	/** Agent registry for IRC routing across live sessions. */
 	agentRegistry?: AgentRegistry;
 	/** Get artifacts directory for artifact:// URLs */
@@ -240,8 +244,8 @@ export interface ToolSession {
 	getActiveModelString?: () => string | undefined;
 	/** Get the current session model object (provider/api capabilities), regardless of how it was chosen. */
 	getActiveModel?: () => Model | undefined;
-	/** Get the session's live effective service tier (undefined = none). Source of truth for subagent `serviceTierSubagent: inherit`. */
-	getServiceTier?: () => ServiceTier | undefined;
+	/** Get the session's live per-family service tiers (undefined = none). Source of truth for subagent `tier.subagent: inherit`. */
+	getServiceTierByFamily?: () => ServiceTierByFamily | undefined;
 	/** Auth storage for passing to subagents (avoids re-discovery) */
 	authStorage?: import("../session/auth-storage").AuthStorage;
 	/** Model registry for passing to subagents (avoids re-discovery) */
@@ -332,6 +336,8 @@ export interface ToolSession {
 	getCheckpointState?: () => CheckpointState | undefined;
 	/** Set or clear active checkpoint state. */
 	setCheckpointState?: (state: CheckpointState | null) => void;
+	/** Get the most recent completed rewind, if this session just rewound a checkpoint. */
+	getLastCompletedRewind?: () => CompletedRewindState | undefined;
 
 	/** Per-session snapshot store of file contents as last shown to the model
 	 *  by `read`/`search`. Used by hashline anchor-stale recovery to
@@ -384,7 +390,7 @@ export const DEFAULT_ESSENTIAL_TOOL_NAMES: readonly string[] = [
 	"bash",
 	"edit",
 	"write",
-	"find",
+	"glob",
 	"eval",
 ] as const;
 
@@ -395,7 +401,7 @@ export const DEFAULT_ESSENTIAL_TOOL_NAMES: readonly string[] = [
  */
 export function computeEssentialBuiltinNames(settings: Settings): string[] {
 	const override = settings.get("tools.essentialOverride") ?? [];
-	const cleaned = override.map(name => name.trim()).filter(Boolean);
+	const cleaned = normalizeToolNames(override.map(name => name.trim()).filter(Boolean));
 	if (cleaned.length > 0) {
 		return cleaned.filter(name => name in BUILTIN_TOOLS);
 	}
@@ -449,8 +455,8 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	eval: s => new EvalTool(s),
 	ssh: loadSshTool,
 	github: GithubTool.createIf,
-	find: s => new FindTool(s),
-	search: s => new SearchTool(s),
+	glob: s => new GlobTool(s, { rootPathAlias: true }),
+	grep: s => new GrepTool(s),
 	lsp: LspTool.createIf,
 	inspect_image: s => new InspectImageTool(s),
 	browser: s => new BrowserTool(s),
@@ -487,8 +493,7 @@ export type ToolName = BuiltinToolName;
 export async function createTools(session: ToolSession, toolNames?: string[]): Promise<Tool[]> {
 	const includeYield = session.requireYieldTool === true;
 	const enableLsp = session.enableLsp ?? true;
-	let requestedTools =
-		toolNames && toolNames.length > 0 ? [...new Set(toolNames.map(name => name.toLowerCase()))] : undefined;
+	let requestedTools = toolNames && toolNames.length > 0 ? normalizeToolNames(toolNames) : undefined;
 	const goalEnabled = session.settings.get("goal.enabled");
 	const goalModeActive = goalEnabled && session.getGoalModeState?.()?.enabled === true;
 	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
@@ -552,7 +557,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	// Auto-include AST counterparts when their text-based sibling is present
 	if (requestedTools) {
 		if (
-			requestedTools.includes("search") &&
+			requestedTools.includes("grep") &&
 			!requestedTools.includes("ast_grep") &&
 			session.settings.get("astGrep.enabled")
 		) {
@@ -602,8 +607,8 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "eval") return allowEval;
 		if (name === "debug") return session.settings.get("debug.enabled");
 		if (name === "todo") return !includeYield && session.settings.get("todo.enabled");
-		if (name === "find") return session.settings.get("find.enabled");
-		if (name === "search") return session.settings.get("search.enabled");
+		if (name === "glob") return session.settings.get("glob.enabled");
+		if (name === "grep") return session.settings.get("grep.enabled");
 		if (name === "github") return session.settings.get("github.enabled");
 		if (name === "ast_grep") return session.settings.get("astGrep.enabled");
 		if (name === "ast_edit") return session.settings.get("astEdit.enabled");
@@ -645,6 +650,13 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 					...(includeYield ? ([["yield", HIDDEN_TOOLS.yield]] as const) : []),
 					...(goalModeActive ? ([["goal", HIDDEN_TOOLS.goal]] as const) : []),
 				];
+
+	const activeToolNames = new Set(baseEntries.map(([name]) => name));
+	if (session.setActiveToolNames) {
+		session.setActiveToolNames(activeToolNames);
+	} else {
+		session.isToolActive = name => activeToolNames.has(name);
+	}
 
 	const baseResults = await Promise.all(
 		baseEntries.map(async ([name, factory]) => {

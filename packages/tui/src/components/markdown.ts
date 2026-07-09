@@ -86,7 +86,11 @@ function createHtmlNormalizationState(): HtmlNormalizationState {
 	return { lists: [], openItems: [], itemHasContent: [] };
 }
 
-const HTML_TAG_REGEX = /<\/?(?:br|p|ol|ul|li|span|text)\b(?:\s[^>]*)?\s*\/?>/gi;
+const HTML_TAG_REGEX = /<\/?(?:br|p|ol|ul|li|span|text|code|hr|blockquote)\b(?:\s[^>]*)?\s*\/?>/gi;
+// Block-level HTML that needs structural (not just textual) rendering: standalone
+// `<hr>` becomes a rule and balanced `<blockquote>…</blockquote>` renders with
+// quote styling. Group 1 captures blockquote inner content; it is undefined for hr.
+const BLOCK_HTML_REGEX = /<hr\b[^>]*\/?>|<blockquote\b[^>]*>([\s\S]*?)<\/blockquote>/gi;
 
 function htmlTagName(tag: string): string {
 	const match = /^<\/?\s*([A-Za-z][A-Za-z0-9:-]*)/.exec(tag);
@@ -124,25 +128,32 @@ function isAtEmptyHtmlListItem(state: HtmlNormalizationState): boolean {
 	return state.openItems[itemIndex] === true && state.itemHasContent[itemIndex] !== true;
 }
 
-function normalizeHtmlForTerminal(raw: string, state: HtmlNormalizationState = createHtmlNormalizationState()): string {
+function normalizeHtmlForTerminal(
+	raw: string,
+	state: HtmlNormalizationState = createHtmlNormalizationState(),
+	codeHook?: (text: string) => string,
+): string {
 	let output = "";
 	let lastIndex = 0;
+	let inCode = false;
 
 	for (const match of raw.matchAll(HTML_TAG_REGEX)) {
 		const tag = match[0];
 		const index = match.index ?? 0;
 		const textBeforeTag = normalizeHtmlEntitiesForTerminal(raw.slice(lastIndex, index));
 		const name = htmlTagName(tag);
-		// Every tag handled here is block-level EXCEPT span and text. For block-level tags,
-		// HTML formatting whitespace between block/list tags (e.g. the newlines and
-		// indentation in pretty-printed `<ul>\n  <li>…`) is not rendered content;
-		// appending it literally would leak source indentation before bullets and
-		// blank rows between items. A whitespace-only slice is always insignificant formatting
-		// and is dropped. But for inline tags like span and text, surrounding whitespace
-		// is significant and must NOT be dropped.
+		// Most tags handled here are block-level. Inline contexts — span, text, and
+		// the content inside a `<code>` run — keep their surrounding whitespace
+		// verbatim because it is significant. For block-level tags, HTML formatting
+		// whitespace between tags (e.g. the newlines and indentation in
+		// pretty-printed `<ul>\n  <li>…`) is not rendered content; appending it
+		// literally would leak source indentation before bullets and blank rows
+		// between items, so a whitespace-only slice is dropped. Text inside a
+		// `<code>` run is routed through `codeHook` so the inline-code theme is
+		// applied without leaking the raw `<code>`/`</code>` tags.
 		const isInlineTag = name === "span" || name === "text";
-		if (isInlineTag || textBeforeTag.trim() !== "") {
-			output += textBeforeTag;
+		if (isInlineTag || inCode || textBeforeTag.trim() !== "") {
+			output += inCode && codeHook ? codeHook(textBeforeTag) : textBeforeTag;
 			markCurrentHtmlItemContent(state, textBeforeTag);
 		}
 		lastIndex = index + tag.length;
@@ -154,10 +165,16 @@ function normalizeHtmlForTerminal(raw: string, state: HtmlNormalizationState = c
 			case "span":
 			case "text":
 				break;
+			case "code":
+				if (isClosing) inCode = false;
+				else if (!isSelfClosing) inCode = true;
+				break;
 			case "br":
+			case "hr":
 				output = appendHtmlLineBreak(output, true);
 				break;
 			case "p":
+			case "blockquote":
 				if (isClosing) {
 					output = appendHtmlLineBreak(output);
 				} else if (output.trim() !== "" && !output.endsWith("\n") && !isAtEmptyHtmlListItem(state)) {
@@ -223,7 +240,7 @@ function normalizeHtmlForTerminal(raw: string, state: HtmlNormalizationState = c
 
 	const remainingText = normalizeHtmlEntitiesForTerminal(raw.slice(lastIndex));
 	markCurrentHtmlItemContent(state, remainingText);
-	return output + remainingText;
+	return output + (inCode && codeHook ? codeHook(remainingText) : remainingText);
 }
 
 function splitTerminalLines(text: string): string[] {
@@ -232,6 +249,155 @@ function splitTerminalLines(text: string): string[] {
 		lines.pop();
 	}
 	return lines;
+}
+
+// ---------------------------------------------------------------------------
+// Tree-guide hanging wrap
+//
+// Models routinely emit box-drawing trees ("├── item") inside plain
+// paragraphs — directory layouts, decision trees. The lexer sees those lines
+// as ordinary prose, so the generic wrap pass restarts wrapped continuations
+// at column 0 and visually shears the tree apart (doubly fast for CJK text,
+// where every glyph is two cells wide). Mirror the guide semantics of
+// `tree(1)` / rich.tree instead: wrap the node text within the cells that
+// remain after the guide prefix, and indent every continuation row under the
+// node text — branch glyphs swap to their pass-through form (`├` → `│`,
+// `└` → blank) so the rails of still-open ancestors stay visually joined.
+// ---------------------------------------------------------------------------
+
+/** Continuation glyph for each guide character a tree prefix may contain. */
+const TREE_GUIDE_CONTINUATION: Record<string, string> = {
+	"│": "│",
+	"┃": "┃",
+	"║": "║",
+	"├": "│",
+	"┣": "┃",
+	"╠": "║",
+	"└": " ",
+	"┗": " ",
+	"╚": " ",
+	"╰": " ",
+	"─": " ",
+	"━": " ",
+	"═": " ",
+	" ": " ",
+};
+
+/** Cheap pre-gate: any guide glyph at all. The structural test is TREE_BRANCH_CONNECTOR_RE. */
+const TREE_GUIDE_ANCHOR_RE = /[│┃║├┣╠└┗╚╰]/;
+
+/**
+ * A prefix qualifies as tree-shaped only when a branch/corner glyph is
+ * immediately followed by a horizontal connector (`├──`, `└─`, `╰──`, …).
+ * A lone rail or branch glyph used as prose ("│ is the Unicode vertical box
+ * drawing glyph…") never qualifies, so such paragraphs keep the plain wrap.
+ */
+const TREE_BRANCH_CONNECTOR_RE = /[├┣╠└┗╚╰][─━═]/;
+
+/** Below this many content cells a hanging wrap degenerates; keep the plain wrap. */
+const MIN_TREE_CONTENT_WIDTH = 8;
+
+const SGR_SEQUENCE_STICKY = /\x1b\[[0-9;:]*m/y;
+const SGR_SEQUENCE_GLOBAL = /\x1b\[[0-9;:]*m/g;
+
+/**
+ * Everything before the last full SGR reset is dead state — drop it so the
+ * re-played `carry` stays bounded by the paragraph's live style run instead
+ * of its whole code history.
+ */
+function compactSgrCarry(carry: string): string {
+	const shortReset = carry.lastIndexOf("\x1b[m");
+	const longReset = carry.lastIndexOf("\x1b[0m");
+	const cut = Math.max(shortReset === -1 ? -1 : shortReset + 3, longReset === -1 ? -1 : longReset + 4);
+	return cut === -1 ? carry : carry.slice(cut);
+}
+
+interface TreeGuidePrefix {
+	/** Index of the first char past the guide run (start of the node text). */
+	end: number;
+	/** SGR sequences interleaved with the guides, in order (zero visible width). */
+	codes: string;
+	/** Guide characters with SGR stripped, exactly as they appear on screen. */
+	guides: string;
+}
+
+/**
+ * Match the leading box-drawing guide run of a rendered line (e.g. `│   ├── `),
+ * tolerating interleaved SGR styling. Returns undefined unless the run
+ * contains a branch glyph joined to a horizontal connector and node text
+ * follows, so dash art, indented prose, and lone glyphs used as prose are
+ * never treated as a tree.
+ */
+function matchTreeGuidePrefix(line: string): TreeGuidePrefix | undefined {
+	let codes = "";
+	let guides = "";
+	let i = 0;
+	while (i < line.length) {
+		if (line.charCodeAt(i) === 0x1b) {
+			SGR_SEQUENCE_STICKY.lastIndex = i;
+			const match = SGR_SEQUENCE_STICKY.exec(line);
+			if (!match) break;
+			codes += match[0];
+			i = SGR_SEQUENCE_STICKY.lastIndex;
+			continue;
+		}
+		const char = line[i]!;
+		if (!(char in TREE_GUIDE_CONTINUATION)) break;
+		guides += char;
+		i++;
+	}
+	if (i >= line.length || !TREE_BRANCH_CONNECTOR_RE.test(guides)) return undefined;
+	return { end: i, codes, guides };
+}
+
+/**
+ * Hanging wrap for box-drawing tree lines inside prose block text.
+ *
+ * Returns undefined when no line needs the treatment, so paragraphs without
+ * overflowing tree lines keep their exact current render. When a paragraph
+ * does hang, its lines are returned pre-split and style-self-contained: the
+ * SGR state open at each line start is re-played onto that line (`carry`),
+ * because the caller's wrap pass — which normally carries SGR state across
+ * the newlines of a single entry — no longer sees them as one entry.
+ */
+function hangWrapTreeGuideLines(text: string, width: number): string[] | undefined {
+	if (width < MIN_TREE_CONTENT_WIDTH || !TREE_GUIDE_ANCHOR_RE.test(text)) return undefined;
+
+	const sourceLines = text.split("\n");
+	const hangs = (line: string): TreeGuidePrefix | undefined => {
+		if (visibleWidth(line) <= width) return undefined;
+		const prefix = matchTreeGuidePrefix(line);
+		if (!prefix) return undefined;
+		if (width - visibleWidth(prefix.guides) < MIN_TREE_CONTENT_WIDTH) return undefined;
+		return prefix;
+	};
+	if (!sourceLines.some(line => hangs(line) !== undefined)) return undefined;
+
+	const out: string[] = [];
+	let carry = "";
+	for (const line of sourceLines) {
+		const prefix = hangs(line);
+		if (!prefix) {
+			out.push(carry ? carry + line : line);
+			carry = compactSgrCarry(carry + (line.match(SGR_SEQUENCE_GLOBAL)?.join("") ?? ""));
+			continue;
+		}
+		// Re-play the SGR state ahead of the node text so the wrapper carries
+		// it onto every continuation row; the codes are zero-width, so measured
+		// row widths are unaffected.
+		const activeCodes = carry + prefix.codes;
+		const rows = wrapTextWithAnsi(activeCodes + line.slice(prefix.end), width - visibleWidth(prefix.guides));
+		let hang = "";
+		for (const guide of prefix.guides) hang += TREE_GUIDE_CONTINUATION[guide] ?? " ";
+		const hangShortfall = visibleWidth(prefix.guides) - visibleWidth(hang);
+		if (hangShortfall > 0) hang += padding(hangShortfall);
+		out.push(carry + line.slice(0, prefix.end) + rows[0]!.slice(activeCodes.length));
+		for (let i = 1; i < rows.length; i++) {
+			out.push(activeCodes + hang + rows[i]!);
+		}
+		carry = compactSgrCarry(carry + (line.match(SGR_SEQUENCE_GLOBAL)?.join("") ?? ""));
+	}
+	return out;
 }
 
 class StrictStrikethroughTokenizer extends Tokenizer {
@@ -623,6 +789,59 @@ function plainInlineTokens(tokens: Token[]): string {
 	return result;
 }
 
+/**
+ * Classify an inline `html` token by tag name and whether it is a closing tag.
+ * Returns null for non-html tokens or raw that isn't a recognizable HTML tag.
+ */
+function inlineHtmlTag(token: Token): { name: string; closing: boolean } | null {
+	if ((token as { type: string }).type !== "html") return null;
+	const raw = (token as { raw?: unknown }).raw;
+	if (typeof raw !== "string") return null;
+	const name = htmlTagName(raw);
+	if (!name) return null;
+	return { name, closing: /^<\s*\//.test(raw) };
+}
+
+/**
+ * Collapse inline `<code>…</code>` runs — which marked emits as separate `html`
+ * open/close tokens around the literal content — into a single synthetic
+ * `codespan` token, so they render with the theme's inline-code styling instead
+ * of leaking the raw tags. HTML entities inside the run are decoded. Stray or
+ * unmatched code tags are dropped; other inline html tokens pass through for the
+ * `html` render path to normalize. Returns the original array when no `<code>`
+ * tag is present (the common case).
+ */
+function collapseInlineHtml(tokens: Token[]): Token[] {
+	let hasCode = false;
+	for (const token of tokens) {
+		if (inlineHtmlTag(token)?.name === "code") {
+			hasCode = true;
+			break;
+		}
+	}
+	if (!hasCode) return tokens;
+
+	const out: Token[] = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const tag = inlineHtmlTag(tokens[i]);
+		if (tag?.name === "code") {
+			if (tag.closing) continue; // stray `</code>` — drop it
+			let j = i + 1;
+			for (; j < tokens.length; j++) {
+				const close = inlineHtmlTag(tokens[j]);
+				if (close?.name === "code" && close.closing) break;
+			}
+			if (j >= tokens.length) continue; // unmatched `<code>` — drop it, render the rest normally
+			const text = normalizeHtmlEntitiesForTerminal(plainInlineTokens(tokens.slice(i + 1, j)));
+			out.push({ type: "codespan", raw: text, text } as Token);
+			i = j;
+			continue;
+		}
+		out.push(tokens[i]);
+	}
+	return out;
+}
+
 // ---------------------------------------------------------------------------
 // Inline hex-color swatches
 // ---------------------------------------------------------------------------
@@ -699,6 +918,26 @@ function codespanSwatch(code: string, glyph: string): string {
 	return colorSwatch(match[1], glyph);
 }
 
+interface RenderSignature {
+	width: number;
+	paddingX: number;
+	paddingY: number;
+	codeBlockIndent: number;
+	themeId: number;
+	defaultTextStyleId: number;
+	imageProtocol: string;
+	hyperlinks: boolean;
+	textSizing: boolean;
+	bgColorProbe: string;
+	headingProbe: string;
+}
+
+interface StreamPrefixLineCache extends RenderSignature {
+	text: string;
+	tokenCount: number;
+	lines: readonly string[];
+}
+
 export class Markdown implements Component {
 	#text: string;
 	#paddingX: number; // Left/right padding
@@ -726,6 +965,22 @@ export class Markdown implements Component {
 	// tokenization, so this cache is independent of the render caches above.
 	#streamPrefixText?: string;
 	#streamPrefixTokens?: Token[];
+	#streamPrefixLineCache?: StreamPrefixLineCache;
+	// Rows of the most recent render() that are settled — top padding plus the
+	// rendered frozen token prefix — exposed via getLastRenderSettledRows()
+	// for native-scrollback commit gating.
+	#lastRenderSettledRows = 0;
+	// Frozen-prefix text backing the last non-zero settled exposure. Settled
+	// rows are declared final downstream, so a render whose frozen text no
+	// longer extends this prefix (a rewind / wholesale rewrite) resets the
+	// exposure to 0 and re-earns it — the exposure is hard-monotone within a
+	// text lineage.
+	#settledExposedText?: string;
+	// True while #renderStreamingContentLines renders the frozen token range:
+	// frozen code blocks highlight even in transient mode so their bytes match
+	// the finalized render (they render once into the prefix line cache, so
+	// the FFI cost is amortized); the volatile tail stays unhighlighted.
+	#renderingFrozenPrefix = false;
 
 	#ignoreTight = false;
 
@@ -751,7 +1006,13 @@ export class Markdown implements Component {
 		this.#codeBlockIndent = Math.max(0, Math.floor(codeBlockIndent));
 	}
 
-	setText(text: string): void {
+	setText(text: string): boolean {
+		// Equality guard: streaming re-emits identical text on ticks that carried
+		// no delta (throttled provider frames, reconciled tool-execution updates).
+		// Without this, the caller-side `#cachedLines` gets thrown away and the
+		// full lex + wrap runs per re-emit — one of the top CPU hotspots during
+		// streaming (issue #4353). Mirrors `Text.setText`'s guard.
+		if (text === this.#text) return false;
 		this.#text = text;
 		if (!text.trim()) {
 			// Blank replacement: render() early-returns before #lexTokens can see
@@ -759,8 +1020,11 @@ export class Markdown implements Component {
 			// outlives the content it indexed.
 			this.#streamPrefixText = undefined;
 			this.#streamPrefixTokens = undefined;
+			this.#streamPrefixLineCache = undefined;
+			this.#settledExposedText = undefined;
 		}
 		this.invalidate();
+		return true;
 	}
 
 	invalidate(): void {
@@ -777,6 +1041,19 @@ export class Markdown implements Component {
 		if (this.#transientRenderCache === next) return;
 		this.#transientRenderCache = next;
 		this.invalidate();
+	}
+
+	/**
+	 * Rows at the top of the most recent render() (top padding + rendered
+	 * frozen-token prefix) whose bytes are settled: byte-stable at this
+	 * width/theme for as long as the text keeps growing append-only. Hosts
+	 * feed this to transcript commit gating (see the coding agent's
+	 * `FinalizableBlock.getTranscriptBlockSettledRows`). 0 outside streaming
+	 * (`transientRenderCache`) mode, after a text rewind (re-earned on the new
+	 * lineage), and on cache-served non-streaming renders.
+	 */
+	getLastRenderSettledRows(): number {
+		return this.#lastRenderSettledRows;
 	}
 
 	// Lex `text` into block tokens, reusing the frozen stable prefix when the text
@@ -798,15 +1075,16 @@ export class Markdown implements Component {
 		) {
 			const tailTokens = markdownParser.lexer(text.slice(prefix.length));
 			const tokens = [...prefixTokens, ...tailTokens];
-			this.#freezeStablePrefix(text, tokens);
+			this.#freezeStablePrefix(text, tokens, { preserveExisting: true });
 			return tokens;
 		}
 		const tokens = markdownParser.lexer(text);
 		if (canStream) {
-			this.#freezeStablePrefix(text, tokens);
+			this.#freezeStablePrefix(text, tokens, { preserveExisting: false });
 		} else {
 			this.#streamPrefixText = undefined;
 			this.#streamPrefixTokens = undefined;
+			this.#streamPrefixLineCache = undefined;
 		}
 		return tokens;
 	}
@@ -816,7 +1094,7 @@ export class Markdown implements Component {
 	// render re-lexes only the unfrozen tail. Caller guarantees no CR / no
 	// reference definitions, so each token's `raw` is a verbatim slice of `text`
 	// and the summed offsets address `text` exactly.
-	#freezeStablePrefix(text: string, tokens: Token[]): void {
+	#freezeStablePrefix(text: string, tokens: Token[], opts: { preserveExisting: boolean }): void {
 		let pos = 0;
 		let frozenEnd = 0;
 		let frozenCount = 0;
@@ -845,7 +1123,14 @@ export class Markdown implements Component {
 			if (next !== 0x20 /* space */ && next !== 0x0a /* \n */) {
 				this.#streamPrefixText = text.slice(0, frozenEnd);
 				this.#streamPrefixTokens = tokens.slice(0, frozenCount);
+				return;
 			}
+		}
+
+		if (!opts.preserveExisting) {
+			this.#streamPrefixText = undefined;
+			this.#streamPrefixTokens = undefined;
+			this.#streamPrefixLineCache = undefined;
 		}
 	}
 
@@ -857,6 +1142,10 @@ export class Markdown implements Component {
 		if (this.#cachedLines && this.#cachedText === this.#text && this.#cachedWidth === width) {
 			return this.#cachedLines;
 		}
+
+		// Recomputed below by the streaming path; every other path (cache-served,
+		// empty text, non-streaming full render) exposes no settled rows.
+		this.#lastRenderSettledRows = 0;
 
 		// Calculate available width for content (subtract horizontal padding)
 		const paddingX = this.#ignoreTight ? this.#paddingX : getPaddingX(this.#paddingX);
@@ -872,6 +1161,7 @@ export class Markdown implements Component {
 
 		// Replace tabs with 3 spaces for consistent rendering
 		const normalizedText = replaceTabs(this.#text);
+		const signature = this.#renderSignature(width, paddingX);
 
 		// L2: module-level LRU — survives component disposal/recreation across
 		// session-tree navigations. Key encodes every dimension that affects the
@@ -887,9 +1177,7 @@ export class Markdown implements Component {
 		// by MarkdownTheme and is one of the most styling-sensitive entries.
 		let cacheKey: string | undefined;
 		if (!this.transientRenderCache) {
-			const bgColorProbe = this.#defaultTextStyle?.bgColor ? this.#defaultTextStyle.bgColor("\x01") : "";
-			const headingProbe = this.#theme.heading("");
-			cacheKey = `${normalizedText}\x00${width}\x00${paddingX}\x00${this.#paddingY}\x00${this.#codeBlockIndent}\x00${objectId(this.#theme)}\x00${this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1}\x00${TERMINAL.imageProtocol ?? ""}\x00${TERMINAL.hyperlinks ? 1 : 0}\x00${TERMINAL.textSizing ? 1 : 0}\x00${bgColorProbe}\x00${headingProbe}`;
+			cacheKey = this.#renderCacheKey(normalizedText, signature);
 			const cached = renderCache.get(cacheKey);
 			if (cached !== undefined) {
 				// Populate L1 so subsequent calls from this instance are O(1) map lookup.
@@ -902,18 +1190,150 @@ export class Markdown implements Component {
 
 		// Parse markdown to HTML-like tokens
 		const tokens = this.#lexTokens(normalizedText);
+		const contentLines = this.transientRenderCache
+			? this.#renderStreamingContentLines(tokens, normalizedText, signature, contentWidth)
+			: this.#renderContentLines(tokens, 0, tokens.length, contentWidth, signature);
+		const emptyLines = this.#renderEmptyPaddingLines(signature);
 
-		// Convert tokens to styled terminal output
-		const renderedLines: string[] = [];
+		// Combine top padding, content, and bottom padding
+		const rawResult = [...emptyLines, ...contentLines, ...emptyLines];
+		const result = rawResult.length > 0 ? rawResult : [""];
 
-		for (let i = 0; i < tokens.length; i++) {
-			const token = tokens[i];
-			const nextToken = tokens[i + 1];
-			const tokenLines = this.#renderToken(token, contentWidth, nextToken?.type);
-			renderedLines.push(...tokenLines);
+		// Update caches and hand the array out by reference. Callers must not
+		// mutate it (Component render contract); the L2 entry is shared across
+		// instances keyed on identical inputs.
+		this.#cachedText = this.#text;
+		this.#cachedWidth = width;
+		this.#cachedLines = result;
+
+		// Update L2 module-level LRU so future instances with the same key skip
+		// the marked.lexer + highlightCode (Rust FFI) work entirely.
+		if (cacheKey !== undefined) {
+			renderCache.set(cacheKey, result);
 		}
 
-		// Wrap lines (NO padding, NO background yet)
+		return result;
+	}
+
+	#renderSignature(width: number, paddingX: number): RenderSignature {
+		const bgColorProbe = this.#defaultTextStyle?.bgColor ? this.#defaultTextStyle.bgColor("\x01") : "";
+		const headingProbe = this.#theme.heading("");
+		return {
+			width,
+			paddingX,
+			paddingY: this.#paddingY,
+			codeBlockIndent: this.#codeBlockIndent,
+			themeId: objectId(this.#theme),
+			defaultTextStyleId: this.#defaultTextStyle ? objectId(this.#defaultTextStyle) : -1,
+			imageProtocol: TERMINAL.imageProtocol ?? "",
+			hyperlinks: TERMINAL.hyperlinks,
+			textSizing: TERMINAL.textSizing,
+			bgColorProbe,
+			headingProbe,
+		};
+	}
+
+	#renderCacheKey(normalizedText: string, signature: RenderSignature): string {
+		return `${normalizedText}\x00${signature.width}\x00${signature.paddingX}\x00${signature.paddingY}\x00${signature.codeBlockIndent}\x00${signature.themeId}\x00${signature.defaultTextStyleId}\x00${signature.imageProtocol}\x00${signature.hyperlinks ? 1 : 0}\x00${signature.textSizing ? 1 : 0}\x00${signature.bgColorProbe}\x00${signature.headingProbe}`;
+	}
+
+	#renderStreamingContentLines(
+		tokens: Token[],
+		normalizedText: string,
+		signature: RenderSignature,
+		contentWidth: number,
+	): string[] {
+		const frozenText = this.#streamPrefixText;
+		const frozenTokenCount = this.#streamPrefixTokens?.length ?? 0;
+		if (frozenText === undefined || frozenTokenCount === 0 || !normalizedText.startsWith(frozenText)) {
+			return this.#renderContentLines(tokens, 0, tokens.length, contentWidth, signature);
+		}
+
+		const contentLines: string[] = [];
+		const reusablePrefix = this.#matchingStreamPrefixLineCache(normalizedText, frozenText, signature);
+		let renderedUntil = 0;
+		if (reusablePrefix && reusablePrefix.tokenCount <= frozenTokenCount) {
+			contentLines.push(...reusablePrefix.lines);
+			renderedUntil = reusablePrefix.tokenCount;
+		}
+
+		if (renderedUntil < frozenTokenCount) {
+			// Frozen tokens render with full fidelity (syntax highlighting on)
+			// so these cached rows byte-match the finalized render.
+			this.#renderingFrozenPrefix = true;
+			try {
+				contentLines.push(
+					...this.#renderContentLines(tokens, renderedUntil, frozenTokenCount, contentWidth, signature),
+				);
+			} finally {
+				this.#renderingFrozenPrefix = false;
+			}
+			renderedUntil = frozenTokenCount;
+		}
+
+		this.#streamPrefixLineCache = {
+			...signature,
+			text: frozenText,
+			tokenCount: frozenTokenCount,
+			lines: contentLines.slice(),
+		};
+
+		// Settled exposure (hard-monotone): these rows are declared final to
+		// the host, so expose them only while the frozen text still extends
+		// the previously exposed prefix; a rewind resets to 0 and re-earns on
+		// the rewritten lineage.
+		if (contentLines.length > 0) {
+			if (this.#settledExposedText === undefined || frozenText.startsWith(this.#settledExposedText)) {
+				this.#settledExposedText = frozenText;
+				this.#lastRenderSettledRows = signature.paddingY + contentLines.length;
+			} else {
+				this.#settledExposedText = undefined;
+			}
+		}
+
+		if (renderedUntil < tokens.length) {
+			contentLines.push(...this.#renderContentLines(tokens, renderedUntil, tokens.length, contentWidth, signature));
+		}
+
+		return contentLines;
+	}
+
+	#matchingStreamPrefixLineCache(
+		normalizedText: string,
+		frozenText: string,
+		signature: RenderSignature,
+	): StreamPrefixLineCache | undefined {
+		const cache = this.#streamPrefixLineCache;
+		if (!cache) return undefined;
+		if (!normalizedText.startsWith(cache.text) || !frozenText.startsWith(cache.text)) return undefined;
+		if (cache.width !== signature.width) return undefined;
+		if (cache.paddingX !== signature.paddingX) return undefined;
+		if (cache.paddingY !== signature.paddingY) return undefined;
+		if (cache.codeBlockIndent !== signature.codeBlockIndent) return undefined;
+		if (cache.themeId !== signature.themeId) return undefined;
+		if (cache.defaultTextStyleId !== signature.defaultTextStyleId) return undefined;
+		if (cache.imageProtocol !== signature.imageProtocol) return undefined;
+		if (cache.hyperlinks !== signature.hyperlinks) return undefined;
+		if (cache.textSizing !== signature.textSizing) return undefined;
+		if (cache.bgColorProbe !== signature.bgColorProbe) return undefined;
+		if (cache.headingProbe !== signature.headingProbe) return undefined;
+		return cache;
+	}
+
+	#renderContentLines(
+		tokens: Token[],
+		start: number,
+		end: number,
+		contentWidth: number,
+		signature: RenderSignature,
+	): string[] {
+		const renderedLines: string[] = [];
+		for (let i = start; i < end; i++) {
+			const token = tokens[i];
+			const nextToken = tokens[i + 1];
+			renderedLines.push(...this.#renderToken(token, contentWidth, nextToken?.type));
+		}
+
 		const wrappedLines: string[] = [];
 		for (const line of renderedLines) {
 			// Skip wrapping for image protocol lines and OSC 66 sized headings
@@ -925,12 +1345,10 @@ export class Markdown implements Component {
 			}
 		}
 
-		// Add margins and background to each wrapped line
-		const leftMargin = padding(paddingX);
-		const rightMargin = padding(paddingX);
+		const leftMargin = padding(signature.paddingX);
+		const rightMargin = padding(signature.paddingX);
 		const bgFn = this.#defaultTextStyle?.bgColor;
 		const contentLines: string[] = [];
-
 		let previousLineWasOsc66 = false;
 
 		for (const line of wrappedLines) {
@@ -953,45 +1371,30 @@ export class Markdown implements Component {
 			}
 
 			previousLineWasOsc66 = false;
-
 			const lineWithMargins = leftMargin + line + rightMargin;
 
 			if (bgFn) {
-				contentLines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
+				contentLines.push(applyBackgroundToLine(lineWithMargins, signature.width, bgFn));
 			} else {
 				// No background - just pad to width
 				const visibleLen = visibleWidth(lineWithMargins);
-				const paddingNeeded = Math.max(0, width - visibleLen);
+				const paddingNeeded = Math.max(0, signature.width - visibleLen);
 				contentLines.push(lineWithMargins + padding(paddingNeeded));
 			}
 		}
 
-		// Add top/bottom padding (empty lines)
-		const emptyLine = padding(width);
+		return contentLines;
+	}
+
+	#renderEmptyPaddingLines(signature: RenderSignature): string[] {
+		const emptyLine = padding(signature.width);
 		const emptyLines: string[] = [];
-		for (let i = 0; i < this.#paddingY; i++) {
-			const line = bgFn ? applyBackgroundToLine(emptyLine, width, bgFn) : emptyLine;
+		const bgFn = this.#defaultTextStyle?.bgColor;
+		for (let i = 0; i < signature.paddingY; i++) {
+			const line = bgFn ? applyBackgroundToLine(emptyLine, signature.width, bgFn) : emptyLine;
 			emptyLines.push(line);
 		}
-
-		// Combine top padding, content, and bottom padding
-		const rawResult = [...emptyLines, ...contentLines, ...emptyLines];
-		const result = rawResult.length > 0 ? rawResult : [""];
-
-		// Update caches and hand the array out by reference. Callers must not
-		// mutate it (Component render contract); the L2 entry is shared across
-		// instances keyed on identical inputs.
-		this.#cachedText = this.#text;
-		this.#cachedWidth = width;
-		this.#cachedLines = result;
-
-		// Update L2 module-level LRU so future instances with the same key skip
-		// the marked.lexer + highlightCode (Rust FFI) work entirely.
-		if (cacheKey !== undefined) {
-			renderCache.set(cacheKey, result);
-		}
-
-		return result;
+		return emptyLines;
 	}
 
 	/**
@@ -1129,7 +1532,7 @@ export class Markdown implements Component {
 					break;
 				}
 				const paragraphText = this.#renderInlineTokens(token.tokens || [], styleContext);
-				lines.push(paragraphText);
+				lines.push(...(hangWrapTreeGuideLines(paragraphText, width) ?? [paragraphText]));
 				// Don't add spacing if next token is space or list
 				if (nextTokenType && nextTokenType !== "list" && nextTokenType !== "space") {
 					lines.push("");
@@ -1160,7 +1563,7 @@ export class Markdown implements Component {
 
 				const codeIndent = padding(this.#codeBlockIndent);
 				lines.push(this.#theme.codeBlockBorder(`\`\`\`${token.lang || ""}`));
-				if (this.#theme.highlightCode && !this.transientRenderCache) {
+				if (this.#theme.highlightCode && (!this.transientRenderCache || this.#renderingFrozenPrefix)) {
 					const highlightedLines = this.#theme.highlightCode(token.text, token.lang);
 					for (const hlLine of highlightedLines) {
 						lines.push(`${codeIndent}${hlLine}`);
@@ -1194,19 +1597,6 @@ export class Markdown implements Component {
 			}
 
 			case "blockquote": {
-				const quoteStyle = (text: string) => this.#theme.quote(this.#theme.italic(text));
-				const quoteStylePrefix = this.#getStylePrefix(quoteStyle);
-				const applyQuoteStyle = (line: string): string => {
-					if (!quoteStylePrefix) {
-						return quoteStyle(line);
-					}
-
-					const lineWithReappliedStyle = line.replace(/\x1b\[0m/g, `\x1b[0m${quoteStylePrefix}`);
-					return quoteStyle(lineWithReappliedStyle);
-				};
-
-				// Blockquotes contain block-level tokens (paragraph, list, code, etc.), so render
-				// children recursively and keep default message styling out of nested content.
 				const quoteInlineStyleContext: InlineStyleContext = {
 					applyText: (text: string) => text,
 					stylePrefix: "",
@@ -1227,13 +1617,7 @@ export class Markdown implements Component {
 					renderedQuoteLines.pop();
 				}
 
-				for (const quoteLine of renderedQuoteLines) {
-					const styledLine = applyQuoteStyle(quoteLine);
-					const wrappedLines = wrapTextWithAnsi(styledLine, quoteContentWidth);
-					for (const wrappedLine of wrappedLines) {
-						lines.push(this.#theme.quoteBorder(`${this.#theme.symbols.quoteBorder} `) + wrappedLine);
-					}
-				}
+				lines.push(...this.#applyQuoteBorder(renderedQuoteLines, width));
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after blockquotes (unless space token follows)
 				}
@@ -1242,9 +1626,7 @@ export class Markdown implements Component {
 
 			case "hr": {
 				const raw = "raw" in token && typeof token.raw === "string" ? token.raw.trim() : "";
-				const char = raw[0] || "";
-				const fillChar = getHrChar(char, this.#theme.symbols.hrChar);
-				lines.push(this.#theme.hr(fillChar.repeat(Math.min(width, 80))));
+				lines.push(this.#renderHrLine(width, raw[0] || ""));
 				if (nextTokenType && nextTokenType !== "space") {
 					lines.push(""); // Add spacing after horizontal rules (unless space token follows)
 				}
@@ -1253,12 +1635,7 @@ export class Markdown implements Component {
 
 			case "html":
 				if ("raw" in token && typeof token.raw === "string") {
-					const cleaned = normalizeHtmlForTerminal(token.raw);
-					const blockLines = splitTerminalLines(cleaned);
-					for (const line of blockLines) {
-						const trimmed = line.trimEnd();
-						lines.push(trimmed.trim() === "" ? "" : this.#applyDefaultStyle(trimmed));
-					}
+					lines.push(...this.#renderHtmlBlock(token.raw, width));
 				}
 				break;
 
@@ -1277,6 +1654,78 @@ export class Markdown implements Component {
 		return lines;
 	}
 
+	/** Render a horizontal rule line themed to `width`, matching `sourceChar` when given. */
+	#renderHrLine(width: number, sourceChar = ""): string {
+		const fillChar = getHrChar(sourceChar, this.#theme.symbols.hrChar);
+		return this.#theme.hr(fillChar.repeat(Math.min(width, 80)));
+	}
+
+	/**
+	 * Wrap already-rendered lines in the blockquote border and quote styling.
+	 * `width` is the full content width; the border reserves two cells.
+	 */
+	#applyQuoteBorder(renderedLines: string[], width: number): string[] {
+		const quoteStyle = (text: string) => this.#theme.quote(this.#theme.italic(text));
+		const quoteStylePrefix = this.#getStylePrefix(quoteStyle);
+		const applyQuoteStyle = (line: string): string => {
+			if (!quoteStylePrefix) {
+				return quoteStyle(line);
+			}
+			const lineWithReappliedStyle = line.replace(/\x1b\[0m/g, `\x1b[0m${quoteStylePrefix}`);
+			return quoteStyle(lineWithReappliedStyle);
+		};
+		const quoteContentWidth = Math.max(1, width - 2);
+		const lines: string[] = [];
+		for (const quoteLine of renderedLines) {
+			const styledLine = applyQuoteStyle(quoteLine);
+			for (const wrappedLine of wrapTextWithAnsi(styledLine, quoteContentWidth)) {
+				lines.push(this.#theme.quoteBorder(`${this.#theme.symbols.quoteBorder} `) + wrappedLine);
+			}
+		}
+		return lines;
+	}
+
+	/**
+	 * Render a block-level `html` token to styled lines. Standalone `<hr>` tags
+	 * become rules and balanced `<blockquote>…</blockquote>` regions render with
+	 * quote styling; the remaining markup is normalized to terminal text (entities
+	 * decoded, `<code>` themed, lists/`<br>`/`<p>` laid out).
+	 */
+	#renderHtmlBlock(raw: string, width: number): string[] {
+		const lines: string[] = [];
+		const state = createHtmlNormalizationState();
+		const codeHook = (text: string): string => this.#theme.code(text) + this.#getDefaultStylePrefix();
+		const flushText = (chunk: string): void => {
+			const cleaned = normalizeHtmlForTerminal(chunk, state, codeHook);
+			if (cleaned.trim() === "") return;
+			for (const line of splitTerminalLines(cleaned)) {
+				const trimmed = line.trimEnd();
+				lines.push(trimmed.trim() === "" ? "" : this.#applyDefaultStyle(trimmed));
+			}
+		};
+		let lastIndex = 0;
+		BLOCK_HTML_REGEX.lastIndex = 0;
+		for (let match = BLOCK_HTML_REGEX.exec(raw); match !== null; match = BLOCK_HTML_REGEX.exec(raw)) {
+			flushText(raw.slice(lastIndex, match.index));
+			lastIndex = match.index + match[0].length;
+			if (match[1] !== undefined) {
+				lines.push(...this.#renderHtmlBlockquote(match[1], width));
+			} else {
+				lines.push(this.#renderHrLine(width));
+			}
+		}
+		flushText(raw.slice(lastIndex));
+		return lines;
+	}
+
+	/** Render the inner content of an HTML `<blockquote>` with quote styling. */
+	#renderHtmlBlockquote(inner: string, width: number): string[] {
+		const cleaned = normalizeHtmlForTerminal(inner, createHtmlNormalizationState(), text => this.#theme.code(text));
+		const innerLines = splitTerminalLines(cleaned).map(line => line.trimEnd());
+		while (innerLines.length > 0 && innerLines[innerLines.length - 1] === "") innerLines.pop();
+		return this.#applyQuoteBorder(innerLines, width);
+	}
+
 	#renderInlineTokens(tokens: Token[], styleContext?: InlineStyleContext): string {
 		let result = "";
 		const resolvedStyleContext = styleContext ?? this.#getDefaultInlineStyleContext();
@@ -1292,7 +1741,7 @@ export class Markdown implements Component {
 			markCurrentHtmlItemContent(htmlState, text);
 		};
 
-		for (const token of tokens) {
+		for (const token of collapseInlineHtml(tokens)) {
 			if (isMathToken(token)) {
 				markHtmlItemWhenContent(token.text);
 				result += applyTextWithNewlines(renderMathToken(token.text));
@@ -1504,7 +1953,7 @@ export class Markdown implements Component {
 				// Code block in list item
 				const codeIndent = padding(this.#codeBlockIndent);
 				lines.push({ text: this.#theme.codeBlockBorder(`\`\`\`${token.lang || ""}`), nested: false });
-				if (this.#theme.highlightCode && !this.transientRenderCache) {
+				if (this.#theme.highlightCode && (!this.transientRenderCache || this.#renderingFrozenPrefix)) {
 					const highlightedLines = this.#theme.highlightCode(token.text, token.lang);
 					for (const hlLine of highlightedLines) {
 						lines.push({ text: `${codeIndent}${hlLine}`, nested: false });
@@ -1773,7 +2222,7 @@ export function renderInlineMarkdown(text: string, mdTheme: MarkdownTheme, baseC
 				})
 				.join(applyText(" "));
 		} else if ("text" in token && typeof token.text === "string") {
-			result += applyText(token.text);
+			result += applyText(normalizeHtmlEntitiesForTerminal(token.text));
 		}
 	}
 	return result;
@@ -1782,7 +2231,7 @@ export function renderInlineMarkdown(text: string, mdTheme: MarkdownTheme, baseC
 function renderInlineTokens(tokens: Token[], mdTheme: MarkdownTheme, applyText: (t: string) => string): string {
 	let result = "";
 	const styleReset = applyText("");
-	for (const token of tokens) {
+	for (const token of collapseInlineHtml(tokens)) {
 		if (isMathToken(token)) {
 			result += applyText(renderMathToken(token.text));
 			continue;
@@ -1792,7 +2241,7 @@ function renderInlineTokens(tokens: Token[], mdTheme: MarkdownTheme, applyText: 
 				if (token.tokens && token.tokens.length > 0) {
 					result += renderInlineTokens(token.tokens, mdTheme, applyText);
 				} else {
-					result += applyText(token.text);
+					result += applyText(normalizeHtmlEntitiesForTerminal(token.text));
 				}
 				break;
 			case "strong":
@@ -1812,9 +2261,14 @@ function renderInlineTokens(tokens: Token[], mdTheme: MarkdownTheme, applyText: 
 				result += mdTheme.link(mdTheme.underline(linkText)) + styleReset;
 				break;
 			}
+			case "html":
+				if ("raw" in token && typeof token.raw === "string") {
+					result += applyText(normalizeHtmlForTerminal(token.raw));
+				}
+				break;
 			default:
 				if ("text" in token && typeof token.text === "string") {
-					result += applyText(token.text);
+					result += applyText(normalizeHtmlEntitiesForTerminal(token.text));
 				}
 				break;
 		}

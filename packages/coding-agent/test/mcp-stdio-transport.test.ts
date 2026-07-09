@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-
 import { resolveStdioSpawnCommand, StdioTransport, writeFrame } from "@oh-my-pi/pi-coding-agent/mcp/transports/stdio";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 describe("resolveStdioSpawnCommand", () => {
 	it("resolves bare Windows commands through PATHEXT and wraps .cmd shims with cmd.exe", async () => {
@@ -33,8 +33,9 @@ describe("resolveStdioSpawnCommand", () => {
 				`""${shim}" "serve" "--mcp""`,
 			]);
 			expect(result.windowsHide).toBe(true);
+			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -62,13 +63,64 @@ describe("resolveStdioSpawnCommand", () => {
 
 			expect(result.cmd).toEqual(["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c", `""${localShim}" "serve""`]);
 			expect(result.windowsHide).toBe(true);
+			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(projectDir, { recursive: true, force: true });
-			await fs.rm(globalDir, { recursive: true, force: true });
+			await removeWithRetries(projectDir);
+			await removeWithRetries(globalDir);
 		}
 	});
 
-	it("launches npm .cmd shims through node so CodeGraph owns the stdio pipes", async () => {
+	it("keeps PATH-resolved npx.cmd on the cmd.exe path so npm preserves stdio semantics", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-npx-"));
+		try {
+			const shim = path.join(tempDir, "npx.cmd");
+			await Bun.write(
+				shim,
+				[
+					"@ECHO off",
+					"GOTO start",
+					":find_dp0",
+					"SET dp0=%~dp0",
+					"EXIT /b",
+					":start",
+					"SETLOCAL",
+					"CALL :find_dp0",
+					"",
+					'IF EXIST "%dp0%\\node.exe" (',
+					'  SET "_prog=%dp0%\\node.exe"',
+					") ELSE (",
+					'  SET "_prog=node"',
+					"  SET PATHEXT=%PATHEXT:;.JS;=;%",
+					")",
+					"",
+					'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%" "%dp0%\\node_modules\\npm\\bin\\npx-cli.js" %*',
+					"",
+				].join("\r\n"),
+			);
+
+			const result = await resolveStdioSpawnCommand(
+				{ type: "stdio", command: "npx", args: ["-y", "mcp-gdb"] },
+				{
+					cwd: tempDir,
+					env: {
+						COMSPEC: "C:\\Windows\\System32\\cmd.exe",
+						PATH: tempDir,
+						PATHEXT: ".cmd",
+					},
+					platform: "win32",
+					hostHasInheritableConsole: true,
+				},
+			);
+
+			expect(result.cmd).toEqual(["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c", `""${shim}" "-y" "mcp-gdb""`]);
+			expect(result.windowsHide).toBe(false);
+			expect(result.detached).toBe(false);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("still launches non-npx npm .cmd shims through node so stdio stays owned by the server process", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-codegraph-"));
 		try {
 			const shim = path.join(tempDir, "codegraph.cmd");
@@ -107,13 +159,15 @@ describe("resolveStdioSpawnCommand", () => {
 						PATHEXT: ".cmd",
 					},
 					platform: "win32",
+					hostHasInheritableConsole: true,
 				},
 			);
 
 			expect(result.cmd).toEqual(["node", entry, "serve", "--mcp"]);
-			expect(result.windowsHide).toBe(true);
+			expect(result.windowsHide).toBe(false);
+			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -154,8 +208,9 @@ describe("resolveStdioSpawnCommand", () => {
 
 			expect(result.cmd).toEqual(["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c", `""${shim}" "serve""`]);
 			expect(result.windowsHide).toBe(true);
+			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -186,8 +241,9 @@ describe("resolveStdioSpawnCommand", () => {
 				`""${shim}" "serve" "--header" "Authorization=^%TOKEN^%""`,
 			]);
 			expect(result.windowsHide).toBe(true);
+			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -218,8 +274,9 @@ describe("resolveStdioSpawnCommand", () => {
 				`""${shim}" "--config" "{^"a^":^"b&c|d^"}""`,
 			]);
 			expect(result.windowsHide).toBe(true);
+			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -258,8 +315,9 @@ describe("resolveStdioSpawnCommand", () => {
 				`""${shim}" "serve" "--mcp""`,
 			]);
 			expect(result.windowsHide).toBe(true);
+			expect(result.detached).toBe(false);
 		} finally {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -285,6 +343,7 @@ describe("resolveStdioSpawnCommand", () => {
 			`""codegraph.cmd" "serve" "--mcp""`,
 		]);
 		expect(result.windowsHide).toBe(true);
+		expect(result.detached).toBe(false);
 	});
 
 	it("routes unresolvable bare Windows commands through cmd.exe so PATHEXT can find a .cmd shim (#3250)", async () => {
@@ -317,6 +376,7 @@ describe("resolveStdioSpawnCommand", () => {
 			`""npx" "-y" "cloakbrowser-mcp@latest""`,
 		]);
 		expect(result.windowsHide).toBe(true);
+		expect(result.detached).toBe(false);
 	});
 
 	it("leaves non-Windows commands untouched", async () => {
@@ -327,6 +387,33 @@ describe("resolveStdioSpawnCommand", () => {
 
 		expect(result.cmd).toEqual(["codegraph", "serve", "--mcp"]);
 		expect(result.windowsHide).toBeUndefined();
+		expect(result.detached).toBe(true);
+	});
+
+	it("keeps console-attached Windows cmd.exe wrapper chains out of CREATE_NO_WINDOW (#3567)", async () => {
+		// The #3544 shape is `cmd.exe` → `node wrapper` → another console
+		// launcher (`cmd.exe /C npx.cmd`, PowerShell, similar). If the OMP host
+		// already owns a terminal console, `windowsHide: true` maps to
+		// CREATE_NO_WINDOW and strips that inheritable console from the direct
+		// hidden wrapper. Grandchildren then allocate fresh visible conhost
+		// windows during startup or reconnect loops (#3567). Keep the tree
+		// attached to OMP's console instead.
+		const result = await resolveStdioSpawnCommand(
+			{ type: "stdio", command: "cmd.exe", args: ["/C", "node .codex\\mcp-wrapper.js"] },
+			{
+				cwd: "C:\\project",
+				env: {
+					COMSPEC: "C:\\Windows\\System32\\cmd.exe",
+					PATH: "",
+					PATHEXT: ".COM;.EXE;.BAT;.CMD",
+				},
+				platform: "win32",
+				hostHasInheritableConsole: true,
+			},
+		);
+
+		expect(result.detached).toBe(false);
+		expect(result.windowsHide).toBe(false);
 	});
 });
 

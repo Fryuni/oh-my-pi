@@ -1,6 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import { type ApiKey, type FetchImpl, getEnvApiKey, type Model, ProviderHttpError, withAuth } from "@oh-my-pi/pi-ai";
+import { type ApiKey, type FetchImpl, getEnvApiKey, type Model, withAuth } from "@oh-my-pi/pi-ai";
+import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import {
 	CODEX_BASE_URL,
 	getCodexAccountId,
@@ -1275,7 +1276,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const xaiCreds = await resolveXAIHttpCredentials(ctx.modelRegistry, resolvedModel);
 				if (!xaiCreds) {
 					throw new Error(
-						"No xAI credentials. Run /login → xAI Grok OAuth (SuperGrok Subscription) or set XAI_API_KEY.",
+						"No xAI credentials. Run /login → xAI Grok OAuth (SuperGrok or X Premium+) or set XAI_API_KEY.",
 					);
 				}
 

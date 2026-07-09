@@ -15,9 +15,10 @@ import type { TreeFilterMode } from "../../config/settings-schema";
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt, matchesSelectDown, matchesSelectUp } from "../../modes/utils/keybinding-matchers";
 import type { SessionTreeNode } from "../../session/session-entries";
+import { toPathList } from "../../tools/path-utils";
 import { shortenPath } from "../../tools/render-utils";
-import { toPathList } from "../../tools/search";
 import { canonicalizeMessage } from "../../utils/thinking-display";
+import { resolveAssistantErrorPresentation } from "../utils/transcript-render-helpers";
 import { DynamicBorder } from "./dynamic-border";
 import { centeredWindow, contentRowWidth, renderScrollableList } from "./selector-helpers";
 
@@ -615,15 +616,20 @@ class TreeList implements Component {
 					const content = normalize(this.#extractContent(msgWithContent.content));
 					result = theme.fg("dim", "developer: ") + theme.fg("muted", content);
 				} else if (role === "assistant") {
+					const presentation = resolveAssistantErrorPresentation(msg);
+					if (presentation.kind === "compact-recovered") {
+						result = theme.fg("success", "assistant: ") + theme.fg("dim", presentation.text);
+						break;
+					}
 					const msgWithContent = msg as { content?: unknown; stopReason?: string; errorMessage?: string };
 					const textContent = normalize(this.#extractContent(msgWithContent.content));
 					if (textContent) {
 						result = theme.fg("success", "assistant: ") + textContent;
+					} else if (presentation.kind === "full") {
+						result =
+							theme.fg("success", "assistant: ") + theme.fg("error", normalize(presentation.text).slice(0, 80));
 					} else if (msgWithContent.stopReason === "aborted") {
 						result = theme.fg("success", "assistant: ") + theme.fg("muted", "(aborted)");
-					} else if (msgWithContent.errorMessage) {
-						const errMsg = normalize(msgWithContent.errorMessage).slice(0, 80);
-						result = theme.fg("success", "assistant: ") + theme.fg("error", errMsg);
 					} else {
 						result = theme.fg("success", "assistant: ") + theme.fg("muted", "(no content)");
 					}
@@ -740,7 +746,7 @@ class TreeList implements Component {
 					.slice(0, 50);
 				return `[bash: ${cmd}${rawCmd.length > 50 ? "..." : ""}]`;
 			}
-			case "search": {
+			case "grep": {
 				const pattern = String(args.pattern || "");
 				const searchPathsInput =
 					typeof args.paths === "string" || Array.isArray(args.paths)
@@ -750,11 +756,18 @@ class TreeList implements Component {
 							: undefined;
 				const paths = toPathList(searchPathsInput);
 				const scope = paths.length > 0 ? paths.join(", ") : ".";
-				return `[search: /${pattern}/ in ${shortenPath(scope)}]`;
+				return `[grep: /${pattern}/ in ${shortenPath(scope)}]`;
 			}
-			case "find": {
-				const paths = Array.isArray(args.paths) ? args.paths.join(", ") : String(args.pattern || ".");
-				return `[find: ${shortenPath(paths)}]`;
+			case "glob": {
+				const globInput =
+					typeof args.path === "string"
+						? args.path
+						: typeof args.paths === "string" || Array.isArray(args.paths)
+							? args.paths
+							: undefined;
+				const paths = toPathList(globInput);
+				const scope = paths.length > 0 ? paths.join(", ") : ".";
+				return `[glob: ${shortenPath(scope)}]`;
 			}
 			case "ls": {
 				const path = shortenPath(String(args.path || "."));

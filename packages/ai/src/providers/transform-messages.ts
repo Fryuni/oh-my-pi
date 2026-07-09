@@ -1,4 +1,6 @@
+import { renderDemotedThinking } from "../dialect/demotion";
 import type { Api, AssistantMessage, Message, Model, ToolCall, ToolResultMessage, UserMessage } from "../types";
+import { isDemotedThinking, kDemotedThinking } from "../utils/block-symbols";
 
 const enum ToolCallStatus {
 	/** A tool result has already been emitted for this tool call; later duplicates must be skipped. */
@@ -125,18 +127,20 @@ function deduplicateToolCallIds(
 }
 
 /**
- * Drop assistant `toolCall` blocks whose `name` is empty or whitespace-only,
+ * Drop assistant `toolCall` blocks whose `id` or `name` is empty / whitespace-only,
  * the `toolResult` messages they point at, and any assistant turn that has no
  * replayable content left.
  *
- * Models occasionally emit `{ "name": "", "arguments": "{}" }` (observed:
- * GLM-5.2 + thinking on long turns, #3458). The agent loop rejects the call
- * at execution time with `Tool  not found`, but the malformed block and its
- * error tool-result stay in `currentContext.messages`, so every subsequent
- * request replays them. Every provider validates the function name —
- * Anthropic 400s on `tool_use.name` (alongside an orphan `tool_result`),
- * OpenAI Chat Completions 400s on `tool_calls[i].function.name` — wedging the
- * session in a 400 loop until manual `/clear`.
+ * Models occasionally emit malformed calls such as `{ "name": "", "arguments": "{}" }`
+ * (observed: GLM-5.2 + thinking on long turns, #3458) or a structurally valid
+ * `toolCall` whose provider/native passthrough id never materialized (`id: ""`).
+ * The agent loop rejects or skips these at execution time, but the malformed block
+ * and its error tool-result can stay in `currentContext.messages`, so every
+ * subsequent request replays them. Every provider validates the call shape —
+ * Anthropic 400s on `tool_use.name` / `tool_use.id` (alongside an orphan
+ * `tool_result`), OpenAI Chat Completions 400s on malformed
+ * `tool_calls[i].function.*` — wedging the session in a 400 loop until manual
+ * `/clear`.
  *
  * Run before any other transform so the rest of the pipeline never sees a
  * malformed call. Idempotent: a re-run on an already-sanitized list returns
@@ -146,13 +150,21 @@ function isMalformedToolCallName(name: string | undefined): boolean {
 	return !name || name.trim().length === 0;
 }
 
+function isMalformedToolCallId(id: string | undefined): boolean {
+	return !id || id.trim().length === 0;
+}
+
+function isMalformedToolCall(block: { id: string; name: string }): boolean {
+	return isMalformedToolCallId(block.id) || isMalformedToolCallName(block.name);
+}
+
 function sanitizeMalformedToolCalls(messages: Message[]): Message[] {
 	// Fast path: skip the rewrite entirely when nothing is malformed.
 	let hasMalformed = false;
 	outer: for (const msg of messages) {
 		if (msg.role !== "assistant") continue;
 		for (const block of msg.content) {
-			if (block.type === "toolCall" && isMalformedToolCallName(block.name)) {
+			if (block.type === "toolCall" && isMalformedToolCall(block)) {
 				hasMalformed = true;
 				break outer;
 			}
@@ -178,7 +190,7 @@ function sanitizeMalformedToolCalls(messages: Message[]): Message[] {
 			const filtered: AssistantMessage["content"] = [];
 			for (const block of msg.content) {
 				if (block.type === "toolCall") {
-					const malformed = isMalformedToolCallName(block.name);
+					const malformed = isMalformedToolCall(block);
 					const queue = dropQueues.get(block.id);
 					if (queue) queue.push(malformed);
 					else dropQueues.set(block.id, [malformed]);
@@ -226,41 +238,20 @@ function isAnthropicMessagesModel(model: Model): model is Model<"anthropic-messa
 }
 
 /**
- * Cross-API `openai-completions` targets that can replay a prior turn's
- * reasoning as a native, signature-stripped `thinking` block on the wire.
- * Anthropic's same-API path (`replayUnsignedThinking`) covers
- * `anthropic-messages` targets directly; this is the analogue for the
- * `openai-completions` branch of the cross-API path (#3433/#3434). 3p ↔ 3p
- * replays between an Anthropic-compatible source (Z.AI Anthropic, Kimi
- * Anthropic, …) and an OpenAI-compat reasoning target on the same vendor must
- * keep reasoning as structured `reasoning_content` instead of degrading it to
- * conversation text.
- *
- * `compat` MUST be the request-time RESOLVED compat that `convertMessages`
- * threads into `transformMessages`, not `model.compat`. OpenCode-hosted
- * reasoning models (`opencode-go`/`opencode-zen`) keep
- * `requiresReasoningContentForToolCalls` off on the base compat to dodge the
- * thinking-off `Extra inputs are not permitted` 400 (#1071) and reactivate it
- * on `compat.whenThinking` for thinking-engaged requests to dodge the
- * `thinking is enabled but reasoning_content is missing` 400 (#1484).
- * `resolveOpenAICompatPolicy` already swaps in `whenThinking` for thinking-on
- * requests, so basing this decision on the resolved compat keeps the predicate
- * and the encoder in lockstep; reading `model.compat` would re-open #1484 for
- * every cross-API switch into an OpenCode reasoning model.
- *
- * The downstream encoder MUST then surface the preserved block on the wire via
- * `reasoningContentField` — see `openai-completions.ts` for the matching
- * branch.
+ * Targets that have proven they read unsigned foreign thinking when replayed
+ * natively. This is a semantic-carry allowlist only: OpenAI-compatible
+ * `reasoning_content` schema requirements and llama.cpp cache-prefix replay are
+ * handled by their encoders and MUST NOT make foreign thinking look meaningful.
  */
-function openAICompletionsReplaysUnsignedThinking(model: Model, compat: Model["compat"]): boolean {
-	if (model.api !== "openai-completions" || !model.reasoning) return false;
-	if (compat === undefined || !("requiresReasoningContentForToolCalls" in compat)) return false;
+function targetReadsForeignThinking(model: Model, compat: Model["compat"]): boolean {
+	if (compat === undefined) return false;
+	if (model.api === "anthropic-messages") {
+		return "replayUnsignedThinking" in compat && compat.replayUnsignedThinking === true;
+	}
+	if (model.api !== "openai-completions") return false;
+	if (!("thinkingFormat" in compat)) return false;
 	if (compat.requiresThinkingAsText) return false;
-	// Hosts that REQUIRE `reasoning_content` on tool-call turns (DeepSeek
-	// reasoning, Kimi, OpenRouter reasoning, OpenCode thinking-on) already
-	// accept the replay; Z.AI-format hosts (Z.AI, Zhipu, Moonshot Kimi native,
-	// Xiaomi MiMo) advertise `reasoning_content` as a continuation hint.
-	return compat.requiresReasoningContentForToolCalls || compat.thinkingFormat === "zai";
+	return model.reasoning && compat.thinkingFormat === "zai";
 }
 
 const ANTHROPIC_TOOL_CALL_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -303,9 +294,10 @@ export function transformMessages<TApi extends Api>(
 	duplicateToolCallIdSuffixPrefix = "_dup",
 	targetCompat: Model<TApi>["compat"] = model.compat,
 ): Message[] {
-	// Drop assistant `toolCall` blocks with empty/whitespace `name` (and their
-	// matched `toolResult` messages) before anything else looks at the history.
-	// Replays of these would 400 every provider — see `sanitizeMalformedToolCalls`.
+	// Drop assistant `toolCall` blocks with empty/whitespace `id` or `name`
+	// (and their matched `toolResult` messages) before anything else looks at
+	// the history. Replays of these would 400 every provider — see
+	// `sanitizeMalformedToolCalls`.
 	messages = sanitizeMalformedToolCalls(messages);
 
 	// Build a map of original tool call IDs to normalized IDs
@@ -350,13 +342,18 @@ export function transformMessages<TApi extends Api>(
 			const isLatestSurvivingAssistant = index === latestSurvivingAssistantIndex;
 			// Signature policy is a second axis. Anthropic cryptographically
 			// binds reasoning signatures to its key+session+model, so cross-model
-			// signatures must be stripped whenever official Anthropic is on
-			// either end of the replay:
-			//   * official → 3p: the 3p target can't reverify the signature;
-			//     keeping it leaks private continuation metadata for no benefit.
-			//   * 3p → official: official rejects a foreign signature outright.
-			//   * official → official cross-model: the new model rejects the
-			//     previous model's signature.
+			// signatures must be stripped whenever a signing Anthropic endpoint
+			// is on either end of the replay:
+			//   * official Anthropic (source): the 3p target can't reverify a
+			//     foreign signature and keeping it leaks continuation metadata
+			//     for no benefit.
+			//   * signing Anthropic (target): official Anthropic, GitHub Copilot,
+			//     ZenMux, Cloudflare AI Gateway `/anthropic`, and Google Vertex
+			//     `publishers/anthropic/…` all forward to signature-enforcing
+			//     Anthropic. Any stale/cross-model signature on the wire triggers
+			//     `400 Invalid signature in thinking block` — same failure class
+			//     whether `officialEndpoint` is true or the endpoint is one of
+			//     the known signing proxies (#4297).
 			// 3p ↔ 3p replays preserve signatures because compatible providers
 			// (Z.AI, DeepSeek, custom `models.yaml` providers) treat them as
 			// opaque continuation hints rather than verified material; stripping
@@ -367,8 +364,8 @@ export function transformMessages<TApi extends Api>(
 			// a custom proxy via `models.yaml` will see signatures stripped, the
 			// conservative direction (degraded reasoning, not broken requests).
 			const isOfficialAnthropicSource = isAnthropicReplay && assistantMsg.provider === "anthropic";
-			const isOfficialAnthropicTarget = isAnthropicTarget && model.compat.officialEndpoint;
-			const officialAnthropicInvolved = isOfficialAnthropicSource || isOfficialAnthropicTarget;
+			const isSigningAnthropicTarget = isAnthropicTarget && model.compat.signingEndpoint;
+			const signingAnthropicInvolved = isOfficialAnthropicSource || isSigningAnthropicTarget;
 			// Compatible Anthropic-messages reasoning targets that accept
 			// unsigned thinking natively (Z.AI, DeepSeek, the generic
 			// `reasoning && !official` case in the compat builder). Used to keep
@@ -406,6 +403,31 @@ export function transformMessages<TApi extends Api>(
 				assistantMsg.content.some(b => b.type === "toolCall");
 			const lastBlockIndex = assistantMsg.content.length - 1;
 
+			const anthropicVisibleThinkingSurvivesReplay = (
+				candidate: AssistantMessage["content"][number],
+				candidateIndex: number,
+			): boolean => {
+				if (candidate.type !== "thinking") return false;
+				if (!isAnthropicReplay) return false;
+				if (isLatestSurvivingAssistant && abandonedToolUse) return true;
+				const candidateSignatureUntrustworthy =
+					abandonedToolUse || (invalidStopReason && candidateIndex === lastBlockIndex);
+				const replaySignature =
+					candidateSignatureUntrustworthy && candidate.thinkingSignature ? undefined : candidate.thinkingSignature;
+				if (!replaySignature && (!candidate.thinking || candidate.thinking.trim() === "")) return false;
+				if (isSameModel && isSigningAnthropicTarget && (!replaySignature || replaySignature.trim() === "")) {
+					return false;
+				}
+				return true;
+			};
+			const hasVisibleAnthropicThinking = assistantMsg.content.some(candidate => candidate.type === "thinking");
+			const dropsAllSameModelVisibleThinking =
+				isAnthropicReplay &&
+				isSameModel &&
+				isSigningAnthropicTarget &&
+				hasVisibleAnthropicThinking &&
+				!assistantMsg.content.some(anthropicVisibleThinkingSurvivesReplay);
+
 			const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
 				if (block.type === "thinking") {
 					// Only an aborted/errored turn's final (mid-stream) block can hold a
@@ -430,7 +452,7 @@ export function transformMessages<TApi extends Api>(
 						if (
 							!isLatestSurvivingAssistant &&
 							!isSameModel &&
-							officialAnthropicInvolved &&
+							signingAnthropicInvolved &&
 							sanitized.thinkingSignature
 						) {
 							sanitized = { ...sanitized, thinkingSignature: undefined };
@@ -438,6 +460,18 @@ export function transformMessages<TApi extends Api>(
 						// Drop blocks with neither a signature anchor nor any text —
 						// nothing for the next turn to replay.
 						if (!sanitized.thinkingSignature && (!sanitized.thinking || sanitized.thinking.trim() === "")) {
+							return [];
+						}
+						// Same-model Anthropic replay to a signature-enforcing endpoint
+						// requires valid signatures to natively replay thinking blocks.
+						// Both undefined and empty string signatures are invalid and must
+						// be dropped entirely — not demoted to text. Demotion would cause
+						// the reasoning_extraction safety classifier to refuse the response.
+						if (
+							isSameModel &&
+							isSigningAnthropicTarget &&
+							(!sanitized.thinkingSignature || sanitized.thinkingSignature.trim() === "")
+						) {
 							return [];
 						}
 						return sanitized;
@@ -450,29 +484,41 @@ export function transformMessages<TApi extends Api>(
 					// thinking blocks before the cross-model paths.
 					if (!sanitized.thinking || sanitized.thinking.trim() === "") return [];
 					if (isSameModel) return sanitized;
-					// Cross-model + cross-API: preserve as a native, signature-stripped
-					// `thinking` block whenever the target encoder can re-emit it on the
-					// wire (today: `openai-completions` reasoning targets that accept
-					// `reasoning_content` as a continuation hint — Z.AI, Zhipu, DeepSeek
-					// reasoning, Kimi native, MiMo, OpenRouter reasoning, …). The source
-					// signature is always dropped because it is bound to the source
-					// wire-format (Anthropic crypto sig / OpenAI Responses encrypted
-					// blob) and would be rejected by the target. Without this branch
-					// every cross-API 3p ↔ 3p switch (Z.AI Anthropic → Z.AI OpenAI,
-					// Kimi Anthropic → Kimi OpenAI, etc.) demoted prior reasoning to
-					// conversation text and lost it as structured reasoning context
-					// (#3433/#3434).
-					if (openAICompletionsReplaysUnsignedThinking(model, targetCompat)) {
+					// Cross-model + cross-API: preserve native thinking only for
+					// targets proven to read unsigned foreign reasoning (Z.AI-format
+					// OpenAI-compatible targets, plus Anthropic-compatible
+					// `replayUnsignedThinking`). Tool-call schema requirements and
+					// llama.cpp cache-prefix replay are orthogonal encoder concerns;
+					// keeping inert foreign CoT native for those flags loses the
+					// canonical visible-text fallback without adding model context.
+					if (targetReadsForeignThinking(model, targetCompat)) {
 						return sanitized.thinkingSignature ? { ...sanitized, thinkingSignature: undefined } : sanitized;
 					}
 					// Other cross-API targets (openai-responses encrypted blobs, google
-					// signed thought parts, anthropic-target from a non-Anthropic source,
-					// or any reasoning-disabled target) can't usefully replay an unsigned
-					// thinking block. Demote to text so the reasoning survives at least
-					// as visible conversation context.
+					// thought parts, anthropic-target from a non-Anthropic source, or any
+					// reasoning-disabled target) can't replay an unsigned thinking block:
+					// the native reasoning slot either rejects a foreign signature or — as
+					// verified end-to-end against Gemini 3 — silently discards unsigned
+					// thought content (it is neither recalled nor influences generation).
+					// Demote to text so the reasoning survives as context, wrapped in the
+					// TARGET model's own canonical thinking-block dialect (e.g. a ```thinking
+					// fence for Gemini) so it reads as reasoning rather than bare prose the
+					// model might mimic.
+					// Mark the demoted block (symbol-keyed, never serialized) instead of
+					// baking a separator into its text: the openai-completions flatten —
+					// the one consumer that joins adjacent text blocks into a single
+					// string — inserts a paragraph break after marked blocks, so the
+					// bare Anthropic-dialect output (or any dialect's wrapped output
+					// whose closing tag isn't a natural word boundary) can't glue onto
+					// the following visible-text block, while ordinary adjacent text
+					// blocks stitched from streaming / bridges / imported transcripts
+					// stay byte-identical. A separator baked into the block text would
+					// leak to non-flattening targets: Anthropic/Bedrock reject a
+					// terminal assistant message whose text ends with whitespace.
 					return {
 						type: "text" as const,
-						text: sanitized.thinking,
+						text: renderDemotedThinking(model.id, sanitized.thinking),
+						[kDemotedThinking]: true,
 					};
 				}
 
@@ -480,13 +526,31 @@ export function transformMessages<TApi extends Api>(
 					// Redacted thinking is native-only. Keep it for same-model
 					// signed replay, the latest byte-for-byte Anthropic turn, or
 					// compatible targets that will also emit sibling unsigned
-					// thinking natively. Drop it when the visible thinking was
-					// cross-model stripped and will be demoted to text.
+					// thinking natively. Drop it when the matching visible thinking
+					// was discarded, or when visible thinking was cross-model
+					// stripped and will be demoted to text.
 					if (isAnthropicReplay) {
+						if (dropsAllSameModelVisibleThinking) return [];
 						if (isSameModel || isLatestSurvivingAssistant || replaysUnsignedAnthropicThinking) return block;
 						return [];
 					}
 					if (isSameModel) return block;
+					return [];
+				}
+
+				if (block.type === "fallback") {
+					// Server-side-fallback boundary marker (Anthropic beta
+					// `server-side-fallback-2026-06-01`). Only the official
+					// Anthropic endpoint accepts this block on replay: every
+					// other target either rejects unknown content blocks with a
+					// 400 (anthropic-compatible endpoints like Umans/Z.AI/MiniMax,
+					// and older omp gateways whose schema pre-dates this feature)
+					// or throws in its converter (Bedrock). Even the official
+					// replay path only accepts the block when the current request
+					// itself opts into the beta — but we don't know that here, so
+					// keep it and let `convertAnthropicMessages` re-check the
+					// per-request opt-in before serializing.
+					if (isAnthropicTarget && model.compat.officialEndpoint) return block;
 					return [];
 				}
 
@@ -503,8 +567,7 @@ export function transformMessages<TApi extends Api>(
 					let normalizedToolCall: ToolCall = toolCall;
 
 					if (!isSameModel && toolCall.thoughtSignature) {
-						normalizedToolCall = { ...toolCall };
-						delete (normalizedToolCall as { thoughtSignature?: string }).thoughtSignature;
+						normalizedToolCall = { ...toolCall, thoughtSignature: undefined };
 					}
 
 					if (isAnthropicTarget) {
@@ -531,6 +594,18 @@ export function transformMessages<TApi extends Api>(
 
 				return block;
 			});
+
+			// A demoted-thinking block that survived as the message's final block can
+			// still end with the thinking text's own trailing whitespace (bare
+			// Anthropic-dialect demotion copies it verbatim), and Anthropic rejects a
+			// terminal assistant message whose text ends with trailing whitespace
+			// ("final assistant content cannot end with trailing whitespace").
+			// trimEnd() is safe: demoted text is synthesized context, never
+			// byte-exact replay material.
+			const finalBlock = transformedContent[transformedContent.length - 1];
+			if (finalBlock?.type === "text" && isDemotedThinking(finalBlock)) {
+				transformedContent[transformedContent.length - 1] = { ...finalBlock, text: finalBlock.text.trimEnd() };
+			}
 
 			return {
 				...assistantMsg,

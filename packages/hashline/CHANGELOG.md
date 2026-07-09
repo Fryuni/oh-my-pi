@@ -2,6 +2,60 @@
 
 ## [Unreleased]
 
+## [16.3.3] - 2026-07-02
+
+### Breaking Changes
+
+- Removed SnapshotStore.byHashExact. Consumers should now use byHash, which resolves collisions by returning the most recently recorded version.
+
+### Changed
+
+- Improved patch application robustness by resolving 16-bit snapshot tag collisions to the most recent version instead of rejecting them.
+
+### Fixed
+
+- Fixed frequent edit rejections after a structural-summary read (affecting parseable code over 100 lines) by automatically inlining unseen anchor lines and merging them into the snapshot's seen lines, allowing immediate retries to succeed without requiring a separate range re-read.
+
+## [16.3.0] - 2026-07-02
+
+### Changed
+
+- Significantly improved performance on large files by optimizing stale-anchor remap validation.
+
+### Fixed
+
+- Fixed an issue where snapshot tag collisions could cause line-anchored edits to be incorrectly applied to unrelated content, improving recovery and edit-preview safety.
+- Fixed tracking of edit anchors when earlier in-session insertions or deletions shift unchanged target lines.
+- Fixed hashline edit guidance and parsing errors for Markdown list rows.
+
+## [16.2.8] - 2026-06-30
+
+### Fixed
+
+- Fixed hashline writes preserving UTF-8 BOM bytes when the host text decoder hides the leading `U+FEFF`. ([#3867](https://github.com/can1357/oh-my-pi/issues/3867))
+
+## [16.2.6] - 2026-06-29
+
+### Fixed
+
+- Fixed a parser error ("payload line has no preceding hunk header") caused by stray dots before the trailing colon in hunk headers, improving compatibility with GLM 5.2 outputs.
+
+## [16.2.0] - 2026-06-27
+
+### Added
+
+- Added `REM` (remove) and `MV` (move/rename) section operations to hashline patches, allowing files to be deleted or relocated (with snapshot history migration) directly within the edit tool.
+
+## [16.1.23] - 2026-06-26
+
+### Added
+
+- Updated prompt documentation to include support for Markdown section operations
+
+### Fixed
+
+- Improved file path recovery to correctly handle read-only or incorrectly typed paths
+
 ## [16.1.14] - 2026-06-22
 
 ### Fixed

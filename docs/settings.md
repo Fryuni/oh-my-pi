@@ -308,7 +308,7 @@ enabledModels:
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `modelRoles` | record | `{}` | Map of role name -> model id. Built-in roles: `default`, `smol`, `slow`, `vision`, `plan`, `designer`, `commit`, `title`, `task`, `advisor`. Per-role env/flags exist only for `--model`/`--smol`/`--slow`/`--plan`; configure the advisor with `modelRoles.advisor`. |
+| `modelRoles` | record | `{}` | Map of role name -> model id. Built-in roles: `default`, `smol`, `slow`, `vision`, `plan`, `designer`, `commit`, `tiny`, `task`, `advisor`. The `tiny` role overrides the online model for lightweight background tasks (titles, memory, auto-thinking, unexpected-stop), else `pi/smol`. Per-role env/flags exist only for `--model`/`--smol`/`--slow`/`--plan`; configure the advisor with `modelRoles.advisor`. |
 | `modelTags` | record | `{}` | Custom role/tag metadata; can introduce additional roles. |
 | `modelProviderOrder` | array | `[]` | Preferred provider order when a model id is ambiguous. |
 | `cycleOrder` | array | `["smol","default","slow"]` | Roles cycled by the model switcher. |
@@ -366,7 +366,11 @@ A value of `-1` means "use the provider/model default" — `omp` does not send t
 | `minP` | number | `-1` | Minimum-probability cutoff. |
 | `presencePenalty` | number | `-1` | Presence penalty. |
 | `repetitionPenalty` | number | `-1` | Repetition penalty. |
-| `serviceTier` | enum | `none` | `none`, `auto`, `default`, `flex`, `scale`, `priority`, `openai-only`, `claude-only`. |
+| `tier.openai` | enum | `none` | `none`, `auto`, `default`, `flex`, `scale`, `priority`. Sent as `service_tier` for OpenAI / OpenAI-Codex and OpenAI-family OpenRouter models. |
+| `tier.anthropic` | enum | `none` | `none`, `priority`. `priority` realizes fast mode on supported direct Claude models (ignored on Bedrock/Vertex and via OpenRouter). |
+| `tier.google` | enum | `none` | `none`, `flex`, `priority`. Gemini API sends it in the body; Vertex sends `priority` via header (`flex` is a no-op on Vertex). |
+| `tier.subagent` | enum | `inherit` | `inherit`, `none`, `auto`, `default`, `flex`, `scale`, `priority`. Applied to the spawned model's family; `inherit` tracks the main agent. |
+| `tier.advisor` | enum | `none` | `inherit`, `none`, `auto`, `default`, `flex`, `scale`, `priority`. Applied to the advisor model's family. |
 | `personality` | enum | `default` | `default`, `friendly`, `pragmatic`, `none`. |
 
 ### Retry and fallback
@@ -418,7 +422,7 @@ tools:
 | `tools.artifactTailBytes` | number | `20` | KB of tail kept inline on spill. |
 | `tools.artifactTailLines` | number | `500` | Max tail lines kept inline on spill. |
 
-Individual built-in tools are toggled by their own keys, e.g. `bash.enabled`, `eval.py`, `eval.js`, `find.enabled`, `search.enabled`, `fetch.enabled`, `browser.enabled`, `astEdit.enabled`, `astGrep.enabled`, `web_search.enabled`, `inspect_image.enabled`.
+Individual built-in tools are toggled by their own keys, e.g. `bash.enabled`, `eval.py`, `eval.js`, `glob.enabled`, `grep.enabled`, `fetch.enabled`, `browser.enabled`, `astEdit.enabled`, `astGrep.enabled`, `web_search.enabled`, `inspect_image.enabled`.
 
 ### Shell, eval, and LSP
 
@@ -503,6 +507,7 @@ contextPromotion:
 compaction:
   enabled: true
   strategy: snapcompact     # context-full, handoff, shake, snapcompact, off
+  midTurnEnabled: true      # check thresholds between tool-loop provider requests
   thresholdPercent: -1       # -1 = default reserve-based behavior
   thresholdTokens: -1        # fixed token limit when > 0
   remoteEnabled: true
@@ -515,6 +520,7 @@ memory:
 |---|---|---|---|
 | `contextPromotion.enabled` | boolean | `true` | Promote relevant earlier context. |
 | `compaction.enabled` | boolean | `true` | Automatic conversation compaction. |
+| `compaction.midTurnEnabled` | boolean | `true` | Check thresholds at safe mid-turn tool-loop boundaries before the next provider request. |
 | `compaction.strategy` | enum | `snapcompact` | `context-full`, `handoff`, `shake`, `snapcompact`, `off`. |
 | `compaction.thresholdPercent` | number | `-1` | Percent-of-context trigger; `-1` = reserve-based default. |
 | `compaction.thresholdTokens` | number | `-1` | Fixed token trigger when `> 0`. |
@@ -591,6 +597,7 @@ providers:
   webSearch: auto
   image: auto
   fetch: auto
+  webSearchGeminiModel: gemini-2.5-flash
   tinyModel: online
   tinyModelDevice: default
   tinyModelDtype: default
@@ -615,6 +622,7 @@ searxng:
 | Key | Type | Default | Values / notes |
 |---|---|---|---|
 | `providers.webSearch` | enum | `auto` | `auto` plus the configured search providers (`perplexity`, `gemini`, `anthropic`, `codex`, `zai`, `exa`, `jina`, `kagi`, `tavily`, `brave`, `kimi`, `parallel`, `synthetic`, `searxng`). |
+| `providers.webSearchGeminiModel` | string | _(unset)_ | Gemini model ID for Google Search grounding when `web_search` uses Gemini; defaults to `gemini-2.5-flash`, overridden by `GEMINI_SEARCH_MODEL`. |
 | `providers.image` | enum | `auto` | `auto`, `openai`, `antigravity`, `xai`, `gemini`, `openrouter`. |
 | `providers.fetch` | enum | `auto` | `auto`, `native`, `trafilatura`, `lynx`, `parallel`, `jina`. |
 | `providers.tinyModel` | enum | `online` | `online` or a local model (`lfm2-350m`, `qwen3-0.6b`, `gemma-270m`, `qwen2.5-0.5b`, `lfm2-700m`). |

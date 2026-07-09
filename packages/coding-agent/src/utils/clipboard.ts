@@ -1,7 +1,48 @@
-import { execSync } from "node:child_process";
 import type { ClipboardImage } from "@oh-my-pi/pi-natives";
 import * as native from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
+
+/**
+ * Run a subprocess and capture its stdout without blocking the event loop.
+ *
+ * `readTextFromClipboard`, `readMacFileUrlsFromClipboard`, and the Termux copy
+ * path all shell out to CLI clipboard tools. The synchronous `execSync` API
+ * parks the render loop until the child exits or the timeout fires, so a hung
+ * clipboard daemon freezes the TUI for the full 2000ms budget (#4235). This
+ * helper mirrors the previous semantics — read stdout as UTF-8, throw on
+ * non-zero exit or timeout, forward optional stdin — but yields to the event
+ * loop while the child runs.
+ *
+ * @throws Error when the child fails to spawn, is killed by the timeout, or
+ *   exits with a non-zero status. Callers rely on this to fall through to the
+ *   outer catch and return an empty string / empty list.
+ */
+async function spawnCapture(cmd: string[], options: { input?: string; timeoutMs?: number } = {}): Promise<string> {
+	const timeoutMs = options.timeoutMs ?? 2000;
+	const proc = Bun.spawn(cmd, {
+		stdout: "pipe",
+		stderr: "ignore",
+		stdin: options.input !== undefined ? Buffer.from(options.input) : "ignore",
+	});
+	let timedOut = false;
+	const timer = setTimeout(() => {
+		timedOut = true;
+		proc.kill();
+	}, timeoutMs);
+	try {
+		const stdout = await new Response(proc.stdout).text();
+		await proc.exited;
+		if (timedOut) {
+			throw new Error(`${cmd[0]} timed out after ${timeoutMs}ms`);
+		}
+		if (proc.exitCode !== 0) {
+			throw new Error(`${cmd[0]} exited with code ${proc.exitCode}`);
+		}
+		return stdout;
+	} finally {
+		clearTimeout(timer);
+	}
+}
 
 function hasDisplay(): boolean {
 	return process.platform !== "linux" || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);
@@ -9,6 +50,59 @@ function hasDisplay(): boolean {
 
 function isWsl(): boolean {
 	return process.platform === "linux" && Boolean(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP);
+}
+
+// AppleScript that returns the POSIX paths of every file URL currently on the
+// macOS pasteboard, one path per line. `pbpaste(1)` only surfaces plain text,
+// EPS, or RTF, so a Finder `Cmd+C` (which puts only a `public.file-url`
+// representation on the pasteboard) makes `pbpaste` empty. AppleScript's
+// `«class furl»` coercion reaches the file-URL representation directly and
+// works for both single-file and multi-file selections. The `try` blocks
+// suppress the `-1700` "can't make … into type" error AppleScript raises when
+// the clipboard holds no file URLs, so the script's exit status only reflects
+// `osascript` itself.
+const MAC_FILE_URL_SCRIPT = [
+	"on run",
+	'\tset output to ""',
+	"\ttry",
+	"\t\tset theClip to the clipboard as «class furl»",
+	"\t\tif class of theClip is list then",
+	"\t\t\trepeat with anItem in theClip",
+	"\t\t\t\ttry",
+	"\t\t\t\t\tset output to output & POSIX path of anItem & linefeed",
+	"\t\t\t\tend try",
+	"\t\t\tend repeat",
+	"\t\telse",
+	"\t\t\ttry",
+	"\t\t\t\tset output to POSIX path of theClip & linefeed",
+	"\t\t\tend try",
+	"\t\tend if",
+	"\tend try",
+	"\treturn output",
+	"end run",
+].join("\n");
+
+/**
+ * Read file paths from the macOS pasteboard's `public.file-url` representation.
+ *
+ * Used to reach the Finder `Cmd+C` pasteboard (which exposes only file URLs,
+ * no plain text or raw image bytes) so an image-file clipboard can be attached
+ * via {@link handleImagePathPaste} instead of falling through to "Clipboard is
+ * empty". Returns an empty array on non-darwin platforms, when AppleScript is
+ * unavailable, or when the pasteboard holds no file URLs.
+ */
+export async function readMacFileUrlsFromClipboard(): Promise<string[]> {
+	if (process.platform !== "darwin") return [];
+	try {
+		const stdout = await spawnCapture(["osascript", "-"], { input: MAC_FILE_URL_SCRIPT });
+		return stdout
+			.split(/\r?\n/)
+			.map(line => line.trim())
+			.filter(line => line.length > 0);
+	} catch (error) {
+		logger.warn("clipboard: failed to read macOS file URLs", { error: String(error) });
+		return [];
+	}
 }
 
 /**
@@ -53,7 +147,7 @@ export async function copyToClipboard(text: string): Promise<void> {
 	try {
 		if (process.env.TERMUX_VERSION) {
 			try {
-				execSync("termux-clipboard-set", { input: text, timeout: 5000 });
+				await spawnCapture(["termux-clipboard-set"], { input: text, timeoutMs: 5000 });
 				return;
 			} catch {
 				// Fall through to native
@@ -229,13 +323,13 @@ export async function readTextFromClipboard(): Promise<string> {
 	try {
 		const p = process.platform;
 		if (p === "darwin") {
-			return execSync("pbpaste", { encoding: "utf8", timeout: 2000 }).toString();
+			return await spawnCapture(["pbpaste"]);
 		}
 		if (p === "win32") {
 			return (await readTextViaPowerShell()) ?? "";
 		}
 		if (process.env.TERMUX_VERSION) {
-			return execSync("termux-clipboard-get", { encoding: "utf8", timeout: 2000 }).toString();
+			return await spawnCapture(["termux-clipboard-get"]);
 		}
 		if (isWsl()) {
 			const text = await readTextViaPowerShell();
@@ -246,14 +340,14 @@ export async function readTextFromClipboard(): Promise<string> {
 		const hasX11Display = Boolean(process.env.DISPLAY);
 		if (hasWaylandDisplay) {
 			try {
-				return execSync("wl-paste --type text/plain --no-newline", { encoding: "utf8", timeout: 2000 }).toString();
+				return await spawnCapture(["wl-paste", "--type", "text/plain", "--no-newline"]);
 			} catch {
 				if (hasX11Display) {
-					return execSync("xclip -selection clipboard -o", { encoding: "utf8", timeout: 2000 }).toString();
+					return await spawnCapture(["xclip", "-selection", "clipboard", "-o"]);
 				}
 			}
 		} else if (hasX11Display) {
-			return execSync("xclip -selection clipboard -o", { encoding: "utf8", timeout: 2000 }).toString();
+			return await spawnCapture(["xclip", "-selection", "clipboard", "-o"]);
 		}
 	} catch (error) {
 		logger.warn("clipboard: failed to read clipboard text", { error: String(error) });

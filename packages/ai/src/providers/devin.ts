@@ -28,7 +28,8 @@ import {
 	StopReason,
 } from "@oh-my-pi/pi-catalog/discovery/devin-gen/exa/codeium_common_pb/codeium_common_pb";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
-import { extractHttpStatusFromError, logger } from "@oh-my-pi/pi-utils";
+import { logger, parseStreamingJson, parseStreamingJsonThrottled } from "@oh-my-pi/pi-utils";
+import * as AIError from "../error";
 import type {
 	Api,
 	AssistantMessage,
@@ -44,8 +45,6 @@ import type {
 } from "../types";
 import { deterministicUuid } from "../utils/deterministic-id";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { parseStreamingJson } from "../utils/json-parse";
-import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { toolWireSchema } from "../utils/schema/wire";
 
 /** Base host for Codeium/Windsurf's Cascade chat API (Connect protocol over HTTP/1.1). */
@@ -70,6 +69,15 @@ const DEVIN_DEFAULT_STOP_PATTERNS = ["<|user|>", "<|bot|>", "<|context_request|>
 /** Connect streaming framing: flag byte bit 0x01 = gzip payload, 0x02 = end-of-stream JSON trailers. */
 const CONNECT_COMPRESSED_FLAG = 0x01;
 const CONNECT_END_STREAM_FLAG = 0x02;
+/**
+ * Hard upper bound on a single Connect frame payload. The 4-byte length prefix
+ * is otherwise attacker-controlled (up to `2**32 - 1`), so a malicious or buggy
+ * peer could force {@link streamDevin}'s reader to buffer gigabytes via
+ * `Buffer.concat` before the idle-timeout wrapper aborts. Well above any
+ * legitimate Cascade response but tight enough that a corrupt length prefix
+ * fails fast instead of consuming memory.
+ */
+const MAX_CONNECT_FRAME_PAYLOAD = 16 * 1024 * 1024;
 
 export const streamDevin: StreamFunction<"devin-agent"> = (
 	model: Model<"devin-agent">,
@@ -79,7 +87,7 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {
-		const startTime = Date.now();
+		const startTime = performance.now();
 		let firstTokenTime: number | undefined;
 
 		const output: AssistantMessage = {
@@ -106,11 +114,16 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 		// accumulated per id (kept out of the content object so finalized tool calls stay clean).
 		const toolBlocks = new Map<string, ToolCall>();
 		const toolPartialJson = new Map<string, string>();
+		// Last-parsed argument-buffer length per tool-call id — bounds the
+		// mid-stream parse work to O(N) via `parseStreamingJsonThrottled`; the
+		// authoritative final parse still runs unconditionally in the toolcall_end
+		// loop below.
+		const toolLastParseLen = new Map<string, number>();
 		let activeToolCallId: string | undefined;
 		let latestStopReason = StopReason.UNSPECIFIED;
 
 		const markFirstToken = () => {
-			if (firstTokenTime === undefined) firstTokenTime = Date.now();
+			if (firstTokenTime === undefined) firstTokenTime = performance.now();
 		};
 
 		const endTextBlock = () => {
@@ -170,12 +183,16 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 
 			if (!response.ok) {
 				const text = await response.text();
-				throw Object.assign(new Error(`Devin API error ${response.status} ${response.statusText}: ${text}`), {
-					status: response.status,
-				});
+				throw new AIError.DevinApiError(
+					`Devin API error ${response.status} ${response.statusText}: ${text}`,
+					response.status,
+				);
 			}
 			if (!response.body) {
-				throw new Error("Devin API error: response body is empty");
+				throw new AIError.ProviderResponseError("Devin API error: response body is empty", {
+					provider: model.provider,
+					kind: "empty-body",
+				});
 			}
 			const body = response.body;
 
@@ -193,6 +210,12 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 				while (pending.length >= 5) {
 					const flag = pending[0];
 					const len = pending.readUInt32BE(1);
+					if (len > MAX_CONNECT_FRAME_PAYLOAD) {
+						throw new AIError.ProviderResponseError(
+							`Devin Connect frame length ${len} exceeds ${MAX_CONNECT_FRAME_PAYLOAD}-byte cap`,
+							{ provider: model.provider, kind: "envelope" },
+						);
+					}
 					if (pending.length < 5 + len) break;
 					const payload = pending.subarray(5, 5 + len);
 					pending = pending.subarray(5 + len);
@@ -200,7 +223,7 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 					if (flag & CONNECT_END_STREAM_FLAG) {
 						const trailerBytes = flag & CONNECT_COMPRESSED_FLAG ? gunzipSync(payload) : payload;
 						const trailerError = readConnectTrailerError(trailerBytes.toString("utf8").trim());
-						if (trailerError) throw new Error(trailerError);
+						if (trailerError) throw new AIError.ValidationError(trailerError);
 						continue;
 					}
 
@@ -276,7 +299,11 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 								: previousJson + tc.argumentsJson;
 							const delta = accumulated.slice(previousJson.length);
 							toolPartialJson.set(toolCallId, accumulated);
-							block.arguments = parseStreamingJson(accumulated);
+							const throttled = parseStreamingJsonThrottled(accumulated, toolLastParseLen.get(toolCallId) ?? 0);
+							if (throttled) {
+								block.arguments = throttled.value;
+								toolLastParseLen.set(toolCallId, throttled.parsedLen);
+							}
 							stream.push({
 								type: "toolcall_delta",
 								contentIndex: output.content.indexOf(block),
@@ -319,20 +346,21 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			output.stopReason = doneReason;
 
 			calculateCost(model, output.usage);
-			output.duration = Date.now() - startTime;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 
 			stream.push({ type: "done", reason: doneReason, message: output });
 			stream.end();
 		} catch (error) {
 			logger.error("devin: stream failed", { error: String(error) });
-			const errorReason: "aborted" | "error" = options?.signal?.aborted ? "aborted" : "error";
-			output.stopReason = errorReason;
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = formatErrorMessageWithRetryAfter(error);
-			output.duration = Date.now() - startTime;
+			const result = await AIError.finalize(error, { api: model.api, signal: options?.signal });
+			output.stopReason = result.stopReason;
+			output.errorStatus = result.status;
+			output.errorId = result.id;
+			output.errorMessage = result.message;
+			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "error", reason: errorReason, error: output });
+			stream.push({ type: "error", reason: result.stopReason, error: output });
 			stream.end();
 		}
 	})();
@@ -373,14 +401,17 @@ async function fetchDevinAuthMetadata(
 	});
 	const payload = new Uint8Array(await response.arrayBuffer());
 	if (!response.ok) {
-		throw Object.assign(
-			new Error(`Devin auth error ${response.status} ${response.statusText}: ${new TextDecoder().decode(payload)}`),
-			{ status: response.status },
+		throw new AIError.DevinApiError(
+			`Devin auth error ${response.status} ${response.statusText}: ${new TextDecoder().decode(payload)}`,
+			response.status,
 		);
 	}
 	const decoded = decodeDevinUserJwtResponse(payload);
 	if (!decoded.userJwt) {
-		throw new Error("Devin auth error: GetUserJwt returned an empty user JWT");
+		throw new AIError.ProviderResponseError("Devin auth error: GetUserJwt returned an empty user JWT", {
+			provider: "devin",
+			kind: "runtime",
+		});
 	}
 	const customBaseUrl = decoded.customApiServerUrl.trim();
 	return { userJwt: decoded.userJwt, ...(customBaseUrl ? { baseUrl: customBaseUrl.replace(/\/+$/, "") } : undefined) };

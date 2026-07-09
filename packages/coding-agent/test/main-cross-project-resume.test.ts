@@ -130,8 +130,7 @@ describe("createSessionManager — shared-bucket local resume", () => {
 				sessionId.slice(0, 8),
 				launchProject,
 				undefined,
-				undefined,
-				"git-remote",
+				{ workspaceIdentifierMode: "git-remote" },
 			);
 		} finally {
 			await result.close();

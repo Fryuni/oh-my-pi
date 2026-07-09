@@ -60,6 +60,26 @@ describe("settings layout", () => {
 		}
 	});
 
+	it("exposes native terminal progress in the appearance settings menu", () => {
+		const def = getSettingsForTab("appearance").find(def => def.path === "terminal.showProgress");
+
+		expect(def).toMatchObject({
+			type: "boolean",
+			label: "Native Terminal Progress",
+			group: "Display",
+		});
+	});
+
+	it("exposes every accepted snapcompact shape in the settings submenu", () => {
+		const def = getSettingsForTab("context").find(def => def.path === "snapcompact.shape");
+
+		expect(def?.type).toBe("submenu");
+		if (def?.type !== "submenu") throw new Error("snapcompact.shape should render as a submenu");
+		const values = def.options.map(option => option.value);
+		expect(values).toContain("silver16-bw");
+		expect(values).toEqual([...SETTINGS_SCHEMA["snapcompact.shape"].values]);
+	});
+
 	it("hides advisor dependent settings when advisor is disabled", () => {
 		const advisorDependentPaths: SettingPath[] = ["advisor.subagents", "advisor.syncBacklog", "advisor.immuneTurns"];
 		const advisorDependentPathSet = new Set(advisorDependentPaths);
@@ -75,5 +95,34 @@ describe("settings layout", () => {
 		for (const def of defs) {
 			expect(def.condition?.()).toBe(true);
 		}
+	});
+
+	it("shows provider request limits as a providers services submenu setting", () => {
+		const [def] = getSettingsForTab("providers").filter(item => item.path === "providers.maxInFlightRequests");
+
+		expect(def).toMatchObject({
+			path: "providers.maxInFlightRequests",
+			type: "providerLimits",
+			tab: "providers",
+			group: "Services",
+		});
+	});
+
+	it("exposes retry fallback chains as editable JSON in the model settings", () => {
+		const def = getSettingsForTab("model").find(item => item.path === "retry.fallbackChains");
+
+		expect(def).toMatchObject({
+			path: "retry.fallbackChains",
+			type: "text",
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Retry Fallback Chains",
+		});
+		if (!def) throw new Error("retry.fallbackChains setting definition missing");
+
+		const description = def.description.toLowerCase();
+		expect(description).toContain("json");
+		expect(description).toContain("fallback");
+		expect(description).toContain("selector");
 	});
 });

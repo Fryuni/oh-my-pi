@@ -465,13 +465,12 @@ describe("OpenAI-family first-event timeouts", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("OpenAI responses stream stalled while waiting for the next event");
-		expect(result.content as unknown[]).toEqual([
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([
 			{
 				type: "toolCall",
 				id: "call_stalled|fc_stalled",
 				name: "todo",
 				arguments: {},
-				partialJson: "",
 			},
 		]);
 	});
@@ -704,6 +703,53 @@ describe("OpenAI-family first-event timeouts", () => {
 		expect(result.content as unknown[]).toEqual([
 			{ type: "text", text: "Hello", textSignature: '{"v":1,"id":"msg_incomplete"}' },
 		]);
+	});
+
+	it("accepts response.done with a completed response as an OpenAI responses terminal event", async () => {
+		const completedResponse = createSseResponse([
+			{ type: "response.created", response: { id: "resp_done" } },
+			{
+				type: "response.output_item.added",
+				item: { type: "message", id: "msg_done", role: "assistant", status: "in_progress", content: [] },
+			},
+			{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+			{ type: "response.output_text.delta", delta: "Hello done" },
+			{
+				type: "response.output_item.done",
+				item: {
+					type: "message",
+					id: "msg_done",
+					role: "assistant",
+					status: "completed",
+					content: [{ type: "output_text", text: "Hello done" }],
+				},
+			},
+			{
+				type: "response.done",
+				response: {
+					id: "resp_done",
+					status: "completed",
+					usage: {
+						input_tokens: 3,
+						output_tokens: 2,
+						total_tokens: 5,
+					},
+				},
+			},
+		]);
+		const fetch: FetchImpl = () => Promise.resolve(completedResponse);
+		const result = await streamOpenAIResponses(openAIResponsesModel, baseContext(), {
+			apiKey: "test-key",
+			fetch,
+		}).result();
+
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.stopReason).toBe("stop");
+		expect(result.content as unknown[]).toContainEqual({
+			type: "text",
+			text: "Hello done",
+			textSignature: '{"v":1,"id":"msg_done"}',
+		});
 	});
 
 	it("errors when Azure OpenAI responses stream closes without a terminal response event", async () => {

@@ -42,7 +42,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
-import { isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { getBlobsDir, isEnoent, logger, VERSION } from "@oh-my-pi/pi-utils";
 import { disableProvider, enableProvider, reset as resetCapabilities } from "../../capability";
 import { Settings } from "../../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
@@ -53,7 +53,7 @@ import {
 } from "../../extensibility/extensions";
 import { runExtensionCompact } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
-import { buildSkillPromptMessage } from "../../extensibility/skills";
+import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { resolveLocalUrlToPath } from "../../internal-urls";
 import { MCPManager } from "../../mcp/manager";
@@ -62,6 +62,7 @@ import { loadAllExtensions } from "../../modes/components/extensions/state-manag
 import { theme } from "../../modes/theme/theme";
 import { type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
@@ -84,6 +85,7 @@ import type { WorkspaceIdentifierMode } from "../../utils/workspace-storage-iden
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
 	buildToolCallStartUpdate,
+	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
@@ -425,6 +427,7 @@ export function createAcpExtensionUiContext(
 		setEditorText: () => {},
 		getEditorText: () => "",
 		editor: async () => undefined,
+		addAutocompleteProvider: () => {},
 		setEditorComponent: () => {},
 		get theme() {
 			return theme;
@@ -446,6 +449,7 @@ export class AcpAgent implements Agent {
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
+	#blobs = new BlobStore(getBlobsDir());
 
 	constructor(connection: AgentSideConnection, createSession: CreateAcpSession, initialSession?: AgentSession) {
 		this.#connection = connection;
@@ -830,28 +834,28 @@ export class AcpAgent implements Agent {
 	}
 
 	async #tryRunSkillCommand(record: ManagedSessionRecord, text: string): Promise<boolean> {
-		if (!text.startsWith("/skill:")) {
-			return false;
-		}
 		if (!record.session.skillsSettings?.enableSkillCommands) {
 			return false;
 		}
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
-		const skillName = commandName.slice("skill:".length);
-		const skill = record.session.skills.find(candidate => candidate.name === skillName);
+		const parsed = parseSkillInvocation(text);
+		if (!parsed) {
+			return false;
+		}
+		const skill = record.session.skills.find(candidate => candidate.name === parsed.name);
 		if (!skill) {
 			return false;
 		}
-		const built = await buildSkillPromptMessage(skill, args);
-		await record.session.promptCustomMessage({
-			customType: SKILL_PROMPT_MESSAGE_TYPE,
-			content: built.message,
-			display: true,
-			details: built.details,
-			attribution: "user",
-		});
+		const built = await buildSkillPromptMessage(skill, parsed.args, "user");
+		await record.session.promptCustomMessage(
+			{
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: built.message,
+				display: true,
+				details: built.details,
+				attribution: "user",
+			},
+			{ streamingBehavior: "steer" },
+		);
 		return true;
 	}
 
@@ -1188,11 +1192,21 @@ export class AcpAgent implements Agent {
 		}
 
 		this.#prepareLiveAssistantMessage(record, event);
+		const imageDataCache = new Map<string, string>();
+		const resolveImageDataForAcp = (data: string, mimeType: string | undefined): string => {
+			const key = `${mimeType ?? ""}\u0000${data}`;
+			const cached = imageDataCache.get(key);
+			if (cached !== undefined) return cached;
+			const resolved = resolveImageDataSync(this.#blobs, data);
+			imageDataCache.set(key, resolved);
+			return resolved;
+		};
 		for (const notification of mapAgentSessionEventToAcpSessionUpdates(event, record.session.sessionId, {
 			getMessageId: message => this.#getLiveMessageId(record, message),
 			getMessageProgress: message => this.#getLiveMessageProgress(record, message),
 			getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
 			cwd: record.session.sessionManager.getCwd(),
+			resolveImageData: resolveImageDataForAcp,
 		})) {
 			await this.#connection.sessionUpdate(notification);
 		}
@@ -1202,13 +1216,61 @@ export class AcpAgent implements Agent {
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
 
 		if (event.type === "agent_end") {
+			await this.#flushMissedFinalAssistantText(record, event);
 			await this.#emitEndOfTurnUpdates(record);
 			await this.#waitForAcpPromptIdle(record);
+			record.liveMessageId = undefined;
+			record.liveMessageProgress = undefined;
 			this.#finishPrompt(record, {
 				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
 				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
 			});
 		}
+	}
+
+	/**
+	 * Deliver the final visible answer when the assistant `message_end` never
+	 * reached this prompt turn's subscription. Session event handlers are
+	 * fire-and-forget (`Agent#emit` does not await async listeners), and
+	 * `agent_end` is flushed through the session's `#endInFlight` path while the
+	 * assistant `message_end` fan-out can still be parked on extension delivery —
+	 * so `agent_end` can overtake `message_end`. Once the turn finishes,
+	 * `#finishPrompt` unsubscribes and the fallback text emission in
+	 * `mapAssistantMessageEnd` is lost for good: a client that only received
+	 * `agent_thought_chunk`s stays stuck on the thinking block (#4902). The live
+	 * message progress records whether visible text ever reached the client; if
+	 * it has not, emit the last assistant message's text before the prompt
+	 * resolves. A `message_end` that lands during the end-of-turn waits still
+	 * takes the normal mapper path and sees `textEmitted` already set, so the
+	 * answer is delivered exactly once.
+	 */
+	async #flushMissedFinalAssistantText(
+		record: ManagedSessionRecord,
+		event: Extract<AgentSessionEvent, { type: "agent_end" }>,
+	): Promise<void> {
+		const progress = record.liveMessageProgress;
+		if (!progress || progress.textEmitted) {
+			return;
+		}
+		const lastAssistant = [...event.messages]
+			.reverse()
+			.find((message): message is AssistantMessage => message.role === "assistant");
+		if (!lastAssistant) {
+			return;
+		}
+		const text = extractAssistantMessageText(lastAssistant);
+		if (text.length === 0) {
+			return;
+		}
+		progress.textEmitted = true;
+		await this.#connection.sessionUpdate({
+			sessionId: record.session.sessionId,
+			update: {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text },
+				messageId: record.liveMessageId,
+			},
+		});
 	}
 
 	async #waitForAcpPromptIdle(record: ManagedSessionRecord): Promise<void> {
@@ -1236,8 +1298,16 @@ export class AcpAgent implements Agent {
 		}
 	}
 
+	/**
+	 * Reset live-message tracking once the assistant `message_end` is handled.
+	 * The `agent_end` reset happens inside the `agent_end` branch of
+	 * `#handlePromptEvent` — after `#flushMissedFinalAssistantText` — so a
+	 * `message_end` that arrives during the end-of-turn waits maps against the
+	 * real progress instead of resurrecting a fresh one (which would double-emit
+	 * the final answer).
+	 */
 	#clearLiveAssistantMessageAfterEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
-		if ((event.type === "message_end" && event.message.role === "assistant") || event.type === "agent_end") {
+		if (event.type === "message_end" && event.message.role === "assistant") {
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
 		}
@@ -1815,6 +1885,10 @@ export class AcpAgent implements Agent {
 			output: usage.output,
 			cacheRead: usage.cacheRead,
 			cacheWrite: usage.cacheWrite,
+			totalTokens: usage.totalTokens,
+			orchestrationInput: usage.orchestrationInput,
+			orchestrationOutput: usage.orchestrationOutput,
+			orchestrationCacheRead: usage.orchestrationCacheRead,
 			premiumRequests: usage.premiumRequests,
 			cost: usage.cost,
 		};
@@ -1825,7 +1899,7 @@ export class AcpAgent implements Agent {
 		const outputTokens = Math.max(0, current.output - previous.output);
 		const cachedReadTokens = Math.max(0, current.cacheRead - previous.cacheRead);
 		const cachedWriteTokens = Math.max(0, current.cacheWrite - previous.cacheWrite);
-		const totalTokens = inputTokens + outputTokens + cachedReadTokens + cachedWriteTokens;
+		const totalTokens = Math.max(0, current.totalTokens - previous.totalTokens);
 
 		if (totalTokens === 0) {
 			return undefined;
@@ -2024,7 +2098,7 @@ export class AcpAgent implements Agent {
 				}
 			}
 		}
-		if (notifications.length === 0 && message.errorMessage && !isSilentAbort(message.errorMessage)) {
+		if (notifications.length === 0 && message.errorMessage && !isSilentAbort(message)) {
 			notifications.push({
 				sessionId,
 				update: {
@@ -2074,6 +2148,7 @@ export class AcpAgent implements Agent {
 		const notifications = mapAgentSessionEventToAcpSessionUpdates(endEvent, sessionId, {
 			cwd,
 			getToolArgs: toolCallId => (toolCallId === message.toolCallId ? options.toolArgs : undefined),
+			resolveImageData: (data, _mimeType) => resolveImageDataSync(this.#blobs, data),
 		});
 		if (options.includeStart === false) {
 			return notifications;

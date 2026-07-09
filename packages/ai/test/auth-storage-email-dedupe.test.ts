@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage, type FetchImpl, type OAuthCredential, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
+import { removeWithRetries } from "../../utils/src/temp";
 import { registerOAuthProvider, unregisterOAuthProviders } from "../src/registry/oauth";
 
 const LEGACY_TIMESTAMP = 1_700_000_000;
@@ -122,7 +123,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		authStorage = null;
 		dbPath = "";
 		if (tempDir) {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 			tempDir = "";
 		}
 	});
@@ -430,7 +431,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 		const freshDbPath = path.join(tempDir, "fresh-schema-agent.db");
 		const freshStore = await SqliteAuthCredentialStore.open(freshDbPath);
 		try {
-			expect(readAuthSchemaVersion(freshDbPath)).toBe(4);
+			expect(readAuthSchemaVersion(freshDbPath)).toBe(5);
 			expect(readTableSql(freshDbPath, "auth_credentials")).not.toContain("unixepoch(");
 			expect(readTableSql(freshDbPath, "auth_credentials")).toContain("strftime('%s','now')");
 		} finally {
@@ -448,7 +449,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 				id INTEGER PRIMARY KEY CHECK (id = 1),
 				version INTEGER NOT NULL
 			);
-			INSERT INTO auth_schema_version(id, version) VALUES (1, 5);
+			INSERT INTO auth_schema_version(id, version) VALUES (1, 6);
 			CREATE TABLE auth_credentials (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
 				provider TEXT NOT NULL,
@@ -464,7 +465,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const reopenedStore = await SqliteAuthCredentialStore.open(futureDbPath);
 		try {
-			expect(readAuthSchemaVersion(futureDbPath)).toBe(5);
+			expect(readAuthSchemaVersion(futureDbPath)).toBe(6);
 		} finally {
 			reopenedStore.close();
 		}
@@ -490,7 +491,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 			const reopened = await SqliteAuthCredentialStore.open(reopenDbPath);
 			try {
 				expect(reopened.listAuthCredentials("openai")).toHaveLength(1);
-				expect(readAuthSchemaVersion(reopenDbPath)).toBe(4);
+				expect(readAuthSchemaVersion(reopenDbPath)).toBe(5);
 			} finally {
 				reopened.close();
 			}
@@ -546,7 +547,7 @@ describe("AuthStorage openai-codex email dedupe", () => {
 
 		const migratedStore = await SqliteAuthCredentialStore.open(legacyDbPath);
 		try {
-			expect(readAuthSchemaVersion(legacyDbPath)).toBe(4);
+			expect(readAuthSchemaVersion(legacyDbPath)).toBe(5);
 			expect(readTableSql(legacyDbPath, "auth_credentials")).not.toContain("unixepoch(");
 			expect(readTableSql(legacyDbPath, "auth_credentials")).toContain("strftime('%s','now')");
 			expect(readStoredIdentityRows(legacyDbPath, "openai-codex")).toEqual([
@@ -662,7 +663,7 @@ describe("AuthStorage OAuth login upgrade and multi-account coexistence", () => 
 	afterEach(async () => {
 		unregisterOAuthProviders("auth-storage-login-upgrade-test");
 		if (tempDir) {
-			await fs.rm(tempDir, { recursive: true, force: true });
+			await removeWithRetries(tempDir);
 		}
 	});
 
@@ -764,8 +765,8 @@ describe("AuthStorage OAuth login upgrade and multi-account coexistence", () => 
 			});
 
 			expect(authStorage.listStoredCredentials("nvidia").map(entry => entry.credential)).toEqual([
-				{ type: "api_key", key: "nvapi-first" },
-				{ type: "api_key", key: "nvapi-second" },
+				{ type: "api_key", key: "nvapi-first", source: "login" },
+				{ type: "api_key", key: "nvapi-second", source: "login" },
 			]);
 
 			const selectedKeys = new Set<string>();
@@ -790,7 +791,7 @@ describe("AuthStorage persistent session stickiness", () => {
 	});
 
 	afterEach(async () => {
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await removeWithRetries(tempDir);
 	});
 
 	it("persists session-sticky credentials across AuthStorage restarts", async () => {

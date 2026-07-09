@@ -1,13 +1,14 @@
-# Advisor and WATCHDOG.md
+# Advisor, WATCHDOG.md, and WATCHDOG.yml
 
-The advisor is an optional second model attached to a session. It reviews the primary agent's transcript after each turn, can inspect the workspace with read-only tools, and injects concise advice back into the primary session.
+The advisor is an optional second model attached to a session. It reviews the primary agent's transcript after each turn, inspects the workspace with its own tools, and injects concise advice back into the primary session.
 
-The advisor is not a second executor. It cannot edit files, run commands, approve actions, or change session state directly.
+The advisor is not a second executor: it cannot approve actions or change primary session state directly. Its default toolset is read-only (`read`, `grep`, `glob`) plus `advise`, but a `WATCHDOG.yml` roster entry may broaden `tools:` to any built-in — including mutating tools such as `edit`, `write`, `bash`, `eval`, and `browser` — so grant those tools only when the advisor model and workspace are trusted (see [Tools and isolation](#tools-and-isolation)).
 
 ## Implementation files
 
 - [`src/advisor/runtime.ts`](../packages/coding-agent/src/advisor/runtime.ts)
 - [`src/advisor/advise-tool.ts`](../packages/coding-agent/src/advisor/advise-tool.ts)
+- [`src/advisor/emission-guard.ts`](../packages/coding-agent/src/advisor/emission-guard.ts)
 - [`src/advisor/watchdog.ts`](../packages/coding-agent/src/advisor/watchdog.ts)
 - [`src/advisor/transcript-recorder.ts`](../packages/coding-agent/src/advisor/transcript-recorder.ts)
 - [`src/prompts/advisor/system.md`](../packages/coding-agent/src/prompts/advisor/system.md)
@@ -71,14 +72,17 @@ When the advisor is enabled mid-session, the cursor seeds to the current primary
 
 ## Tools and isolation
 
-The advisor receives a hard-isolated read-only tool set:
+The advisor is a full agent with its own `Agent` instance and a distinct `ToolSession` whose id is suffixed `-advisor`. The advisor therefore does not share the primary agent's file snapshots, seen-lines tracking, conflict state, summary cache, or edit/yield capabilities.
+
+Every advisor has the `advise` tool for surfacing notes into the primary transcript. Its investigative pool defaults to the read-only subset:
 
 - `read`
-- `search`
-- `find`
-- `advise`
+- `grep`
+- `glob`
 
-The read/search/find tools are built against a distinct `ToolSession` whose session id is suffixed with `-advisor`. The advisor therefore does not share the primary agent's file snapshots, seen-lines tracking, conflict state, summary cache, or edit/yield capabilities.
+A `WATCHDOG.yml` roster entry may broaden this with `tools: [...]`, selecting any subset of the built-in pool the session actually built (a factory that returned `null`, e.g. `lsp` with no matching servers, is absent). Grantable tools include mutating ones: `edit`, `write`, `bash`, `eval`, `browser`, `debug`, `ast_edit`, `task`, `job`, and the memory tools. Tool names outside [`BUILTIN_TOOL_NAMES`](../packages/coding-agent/src/tools/builtin-names.ts) are dropped with a warning.
+
+Advisor grants are not routed through the primary agent's approval wrapper. The advisor pool is built from the built-in tool factories against its own `-advisor` `ToolSession` and then filtered by `WATCHDOG.yml`; it is not the primary `toolRegistry` wrapped with `ExtensionToolWrapper`. Granting write- or exec-tier tools therefore lets the advisor invoke those tools directly, subject to the tool's own runtime guards but not to `tools.approvalMode` / `tools.approval.<tool>` prompts. Keep mutating grants narrow and trusted.
 
 The `advise` tool accepts one note and an optional severity:
 
@@ -99,6 +103,19 @@ note text
 When you deliberately interrupt the agent (Esc, or a cancel from collab, ACP, RPC, the SDK, or an extension), the advisor stops auto-resuming it. An interrupting `concern`/`blocker` raised while the run is stopped is recorded as a visible advisor card instead of restarting the turn, and a concern already in flight when you interrupt is preserved the same way rather than driving a surprise resume. The advice re-enters context the next time you resume — a new message, the `.`/`c` continue shortcut, or a steer/follow-up. A normal yield is unaffected: the advisor can still steer and resume a run the agent ended on its own.
 
 `advisor.immuneTurns` limits interruption frequency. After the advisor successfully delivers a `concern` or `blocker` through the steering channel, later concerns/blockers are routed as non-interrupting asides until the configured number of primary turns has completed. The default is `3`. `nit` notes are unchanged, and advice raised while user-interrupt auto-resume suppression is active is still preserved instead of restarting a stopped run.
+
+### Emission guard
+
+`AdvisorEmissionGuard` (in `src/advisor/emission-guard.ts`) sits on the `enqueueAdvice` boundary in `AgentSession` and enforces — in code — the advisor system prompt's "at most one `advise` per update" and "NEVER send the same advice twice" rules. Each call to the advisor's `advise` tool runs through the guard before it routes to the YieldQueue / steer channel:
+
+1. **Normalization.** Lowercase, NFKC, collapse every run of non-alphanumeric characters to a single space, trim. `"Stop."`, `"*Stop*"`, and `"  stop  "` all key to `stop`.
+2. **Content-free phrase filter.** A small allowlist of normalized phrases the advisor occasionally emits but that carry no concrete reason — `stop`, `done`, `complete`, `no issue continue`, `lgtm`, `nothing to add`, `no further input`, and similar — is suppressed silently. Silence is the correct expression of "no concerns".
+3. **Exact-text dedupe.** Any normalized note already accepted in this session is dropped. The dedupe history is bounded by a FIFO ring (default 4096 entries).
+4. **Per-update rate limit.** At most one note per advisor model `prompt()` cycle is accepted; the runtime calls `host.beginAdvisorUpdate?.()` before each cycle to reset the gate. Suppressed calls never consume the budget — a noise call doesn't displace a real concern that follows in the same update.
+
+Suppression is invisible to the advisor model: `AdviseTool` still returns `Recorded.` for a dropped call. Surfacing "suppressed" back into advisor context risks the model rephrasing the same useless note to bypass the dedupe.
+
+The guard's full state — dedupe history and per-update gate — clears on every advisor reset (compaction, session switch, `/new`), so a re-primed reviewer can re-raise issues it already raised against the rewritten transcript.
 
 ## Bounded catch-up with `advisor.syncBacklog`
 
@@ -187,6 +204,42 @@ Especially pay attention to:
 
 Later project files sit closer to the end of the advisor prompt, so narrower directory guidance is more prominent than broad ancestor guidance.
 
+## WATCHDOG.yml
+
+`WATCHDOG.yml` (or `WATCHDOG.yaml`) is the advisor roster. Where `WATCHDOG.md` supplies review priorities, `WATCHDOG.yml` declares the advisors themselves — one entry per name, each with its own model, tool grant, and specialization prompt. The `/advisor configure` overlay edits this file in place. Files that fail to parse or fail schema validation are logged and skipped so one bad project config cannot kill the session.
+
+Example:
+
+```yaml
+instructions: |
+  Everyone: prefer diffs that keep tests unified.
+
+advisors:
+  - name: Architecture
+    model: anthropic/claude-sonnet-4-5:medium
+    tools: [read, grep, glob]
+    instructions: |
+      Watch cross-module coupling and public-API growth.
+
+  - name: Fixer
+    model: anthropic/claude-sonnet-4-5:high
+    tools: [read, grep, glob, edit, bash]
+    instructions: |
+      You may edit and run tests to prove a fix locally, then advise.
+```
+
+Fields:
+
+- `instructions` (top level): shared prompt prepended to every advisor's system prompt alongside `WATCHDOG.md`. Concatenated across all discovered `WATCHDOG.yml` files.
+- `advisors[].name`: human label; slugified for the session id and the `<session>/__advisor.jsonl` filename. Duplicate slugs across files are resolved by the same specificity rule as `WATCHDOG.md` discovery (project leaf > project ancestor > user).
+- `advisors[].model`: optional model selector with optional `:level` thinking suffix (e.g. `x-ai/grok-code-fast:high`). Omitted → the advisor uses `modelRoles.advisor`.
+- `advisors[].tools`: optional list of built-in tool names to grant. Omitted or empty → the default `read`/`grep`/`glob` subset. Any name in [`BUILTIN_TOOL_NAMES`](../packages/coding-agent/src/tools/builtin-names.ts) is accepted, including mutating tools (`edit`, `write`, `bash`, `eval`, `browser`, `debug`, `ast_edit`, `task`, `job`, and the memory tools). Legacy aliases (`search`→`grep`, `find`→`glob`) are normalized. Unknown names are dropped with a warning. See [Tools and isolation](#tools-and-isolation) for the safety implications of granting mutating tools.
+- `advisors[].instructions`: this advisor's specialization, appended after the shared baseline. Both instruction fields expand `@path` imports like `WATCHDOG.md`.
+
+### Discovery locations
+
+`WATCHDOG.yml`/`WATCHDOG.yaml` share the same user + project search path as `WATCHDOG.md`: the user-level `<active agent dir>/WATCHDOG.yml` plus every `WATCHDOG.yml`/`.omp/WATCHDOG.yml` encountered while walking from `cwd` up to the repository root (or the home directory when no repo root is found). All discovered files are loaded together; a more-specific file (project leaf > project ancestor > user) replaces an earlier entry with the same advisor slug.
+
 ## Subagents
 
 `advisor.subagents` controls whether spawned task/eval subagents also get an advisor runtime.
@@ -224,4 +277,4 @@ Why a file:
 
 The file follows session switches: on `/new`, resume/switch, and branch the recorder reopens at the new session's path on the next advisor turn; before a `/drop` deletes the old artifacts dir the recorder feed is detached and drained so a queued write cannot recreate the deleted file. The on-disk log is append-only and independent of the in-memory context — re-primes and compaction never truncate it.
 
-The advisor is never a peer. The `advisor`-kind registry ref is excluded from every agent-facing surface — the `irc` peer roster and broadcast targets, the subagent peer prompt, and the `history://` index/lookup/completions — and cannot be messaged (`irc send` and collab chat refuse it) or revived/killed from the Agent Hub or collab. It is observability only.
+The advisor is never a peer. The `advisor`-kind registry ref is excluded from every agent-facing surface — the `irc` peer roster and broadcast targets, the subagent peer prompt, and the `history://` index/lookup/completions — and cannot be messaged (`irc send` and collab chat refuse it) or revived/killed from the Agent Hub or collab. It is not addressable as a peer, regardless of what tools it has been granted.

@@ -1,31 +1,40 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { type AutocompleteProvider, matchesKey, type SlashCommand } from "@oh-my-pi/pi-tui";
 import { $env, isEnoent, logger, sanitizeText } from "@oh-my-pi/pi-utils";
 import { isSettingsInitialized, settings } from "../../config/settings";
 import { resolveLocalRoot } from "../../internal-urls";
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
+import { extractImagePathFromText } from "../../modes/components/custom-editor";
 import { renderSegmentTrack } from "../../modes/components/segment-track";
 import { TinyTitleDownloadProgressComponent } from "../../modes/components/tiny-title-download-progress";
 import { expandEmoticons } from "../../modes/emoji-autocomplete";
 import { materializeImageReferenceLinks, shiftImageMarkers } from "../../modes/image-references";
 import { createPromptActionAutocompleteProvider } from "../../modes/prompt-action-autocomplete";
+import { invokeSkillCommandFromText, isKnownSkillCommand } from "../../modes/skill-command";
 import type { InteractiveModeContext } from "../../modes/types";
 import manualContinuePrompt from "../../prompts/system/manual-continue.md" with { type: "text" };
-import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { isTinyTitleLocalModelKey } from "../../tiny/models";
 import { isLowSignalTitleInput } from "../../tiny/text";
 import { tinyTitleClient } from "../../tiny/title-client";
 import type { TinyTitleProgressEvent } from "../../tiny/title-protocol";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
-import { copyToClipboard, readImageFromClipboard, readTextFromClipboard } from "../../utils/clipboard";
+import { vocalizer } from "../../tts/vocalizer";
+import {
+	copyToClipboard,
+	readImageFromClipboard,
+	readMacFileUrlsFromClipboard,
+	readTextFromClipboard,
+} from "../../utils/clipboard";
 import { EnhancedPasteController } from "../../utils/enhanced-paste";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
 import { ensureSupportedImageInput, ImageInputTooLargeError, loadImageInput } from "../../utils/image-loading";
 import { resizeImage } from "../../utils/image-resize";
-import { generateSessionTitle, setSessionTerminalTitle } from "../../utils/title-generator";
+import { generateSessionTitle } from "../../utils/title-generator";
 
 /**
  * Slash commands that may carry secrets in their arguments should never be
@@ -77,6 +86,20 @@ function hasPasteText(value: unknown): value is PasteTarget {
 	return typeof value === "object" && value !== null && typeof (value as PasteTarget).pasteText === "function";
 }
 
+const SHELL_PROMPT_COMMAND_RE =
+	/^(?:\.{0,2}\/|~\/|cd(?:\s|$)|sudo(?:\s|$)|git(?:\s|$)|bun(?:\s|$)|npm(?:\s|$)|pnpm(?:\s|$)|yarn(?:\s|$)|node(?:\s|$)|python\d*(?:\s|$)|cargo(?:\s|$)|go(?:\s|$)|make(?:\s|$)|docker(?:\s|$)|kubectl(?:\s|$))/;
+const SHELL_PROMPT_OPERATOR_RE = /(?:^|\s)(?:&&|\|\||\||2>&1|[<>]{1,2})(?:\s|$)/;
+const OMP_STATUS_LINE_RE = /^\s*in:\s+\d+\s+out:\s+\d+(?:\s+cache\s+\S+)?\s+t:\s+\S+\s+tok\/s:\s+\S+/m;
+
+function looksLikePastedShellPrompt(code: string): boolean {
+	const firstLine = code.split("\n", 1)[0]?.trimStart() ?? "";
+	return (
+		SHELL_PROMPT_COMMAND_RE.test(firstLine) ||
+		SHELL_PROMPT_OPERATOR_RE.test(firstLine) ||
+		OMP_STATUS_LINE_RE.test(code)
+	);
+}
+
 function pythonCommandPrefixLength(trimmedText: string): 0 | 1 | 2 {
 	if (trimmedText.charCodeAt(0) !== 36 /* $ */) return 0;
 	if (trimmedText.charCodeAt(1) === 123 /* { */) return 0;
@@ -91,8 +114,10 @@ function parsePythonCommandInput(text: string): { code: string; isExcluded: bool
 	const trimmed = text.trimStart();
 	const prefixLength = pythonCommandPrefixLength(trimmed);
 	if (prefixLength === 0) return undefined;
+	const code = trimmed.slice(prefixLength).trim();
+	if (prefixLength === 1 && looksLikePastedShellPrompt(code)) return undefined;
 	return {
-		code: trimmed.slice(prefixLength).trim(),
+		code,
 		isExcluded: prefixLength === 2,
 	};
 }
@@ -100,6 +125,17 @@ function parsePythonCommandInput(text: string): { code: string; isExcluded: bool
 /** Wrap pasted text in `<attachment>` tags so the model treats it as one quoted block. */
 function wrapPasteInAttachmentBlock(content: string): string {
 	return `<attachment>\n${content}\n</attachment>`;
+}
+
+/** Run a teardown abort that must never throw (Esc / Ctrl+C path). A thrown
+ *  error is logged at debug instead of silently swallowed, so a failing abort
+ *  stays diagnosable without disturbing teardown ordering. */
+function safeAbort(label: string, fn: () => void): void {
+	try {
+		fn();
+	} catch (err) {
+		logger.debug(`Failed to abort ${label}`, { error: err instanceof Error ? err.message : String(err) });
+	}
 }
 
 const TINY_TITLE_PROGRESS_DONE_TTL_MS = 3_000;
@@ -126,7 +162,12 @@ export class InputController {
 		private clipboard: {
 			readImage: typeof readImageFromClipboard;
 			readText: typeof readTextFromClipboard;
-		} = { readImage: readImageFromClipboard, readText: readTextFromClipboard },
+			readMacFileUrls?: typeof readMacFileUrlsFromClipboard;
+		} = {
+			readImage: readImageFromClipboard,
+			readText: readTextFromClipboard,
+			readMacFileUrls: readMacFileUrlsFromClipboard,
+		},
 	) {}
 
 	#enhancedPaste?: EnhancedPasteController;
@@ -186,6 +227,10 @@ export class InputController {
 		const unsubscribe = tinyTitleClient.onProgress(update);
 	}
 
+	#abortStreamingTurn(): void {
+		void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
+	}
+
 	setupKeyHandlers(): void {
 		this.ctx.editor.setActionKeys("app.interrupt", this.ctx.keybindings.getKeys("app.interrupt"));
 		if (!this.#focusedLeftTapListenerInstalled) {
@@ -240,21 +285,15 @@ export class InputController {
 				const viewSession = this.ctx.viewSession;
 				let aborted = false;
 				if (viewSession.isCompacting) {
-					try {
-						viewSession.abortCompaction();
-					} catch {}
+					safeAbort("compaction", () => viewSession.abortCompaction());
 					aborted = true;
 				}
 				if (viewSession.isGeneratingHandoff) {
-					try {
-						viewSession.abortHandoff();
-					} catch {}
+					safeAbort("handoff", () => viewSession.abortHandoff());
 					aborted = true;
 				}
 				if (viewSession.isRetrying) {
-					try {
-						viewSession.abortRetry();
-					} catch {}
+					safeAbort("retry", () => viewSession.abortRetry());
 					aborted = true;
 				}
 				if (aborted) return;
@@ -263,7 +302,7 @@ export class InputController {
 			if (this.ctx.loopModeEnabled) {
 				this.ctx.pauseLoop();
 				if (this.ctx.session.isStreaming) {
-					void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
+					this.#abortStreamingTurn();
 				} else {
 					this.ctx.cancelPendingSubmission();
 				}
@@ -314,11 +353,16 @@ export class InputController {
 				this.ctx.isPythonMode = false;
 				this.ctx.updateEditorBorderColor();
 			} else if (this.ctx.session.isStreaming) {
-				void this.ctx.session.abort({ reason: USER_INTERRUPT_LABEL });
+				this.#abortStreamingTurn();
 			} else if (this.ctx.editor.getText().trim()) {
-				// Esc with typed text clears the draft instead of (or before) any double-Esc action
-				this.ctx.editor.setText("");
-				this.ctx.ui.requestRender();
+				// Esc must not destroy an in-progress draft.
+				this.ctx.lastEscapeTime = 0;
+			} else if (vocalizer.isSpeaking()) {
+				// TTS buffers seconds of PCM past the streaming abort, so an Esc
+				// arriving after the model stopped would otherwise fall through to
+				// the double-Esc gesture while Kokoro reads on. Silence first;
+				// tree/branch stays reachable via a second Esc.
+				vocalizer.clear();
 				this.ctx.lastEscapeTime = 0;
 			} else {
 				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting
@@ -458,7 +502,7 @@ export class InputController {
 			const wasPythonMode = this.ctx.isPythonMode;
 			const trimmed = text.trimStart();
 			this.ctx.isBashMode = trimmed.startsWith("!");
-			this.ctx.isPythonMode = pythonCommandPrefixLength(trimmed) > 0;
+			this.ctx.isPythonMode = parsePythonCommandInput(trimmed) !== undefined;
 			if (wasBashMode !== this.ctx.isBashMode || wasPythonMode !== this.ctx.isPythonMode) {
 				this.ctx.updateEditorBorderColor();
 			}
@@ -649,11 +693,18 @@ export class InputController {
 			}
 
 			// Handle skill commands (/skill:name [args]). Enter ⇒ steer (matches the
-			// free-text Enter semantics applied a few lines below at the streaming
-			// branch). Ctrl+Enter routes through `handleFollowUp` and dispatches the
-			// same helper with `"followUp"`.
-			if (text && (await this.#invokeSkillCommand(text, "steer"))) {
-				return;
+			// free-text Enter semantics below); Ctrl+Enter routes through `handleFollowUp`.
+			// During compaction, queue immediately so bash/python/loop-mode branches do
+			// not consume the skill before the compaction-resume path re-parses it.
+			if (text && isKnownSkillCommand(this.ctx, text)) {
+				if (this.ctx.session.isCompacting) {
+					const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
+					this.ctx.queueCompactionMessage(text, "steer", images);
+					return;
+				}
+				if (await this.#invokeSkillCommand(text, "steer", inputImages, inputImageLinks)) {
+					return;
+				}
 			}
 
 			// Handle bash command (! for normal, !! for excluded from context)
@@ -762,20 +813,14 @@ export class InputController {
 					this.ctx.session.sessionId,
 					this.ctx.session.model,
 					provider => this.ctx.session.agent.metadataForProvider(provider),
-					this.ctx.titleSystemPrompt,
+					this.ctx.session.titleSystemPrompt,
 				)
 					.then(async title => {
 						// Re-check: a concurrent attempt for an earlier message may have
-						// already named the session. Don't clobber it.
+						// already named the session. Don't clobber it. Terminal title and
+						// accent updates fire from the onSessionNameChanged listener.
 						if (title && !this.ctx.sessionManager.getSessionName()) {
-							const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
-							if (applied) {
-								setSessionTerminalTitle(
-									this.ctx.sessionManager.getSessionName()!,
-									this.ctx.sessionManager.getCwd(),
-								);
-								this.ctx.updateEditorBorderColor();
-							}
+							await this.ctx.sessionManager.setSessionName(title, "auto");
 						}
 					})
 					.catch(err => {
@@ -958,7 +1003,7 @@ export class InputController {
 			//
 			// SIGTSTP: brush-core (the embedded shell behind every bash tool call)
 			// installs a tokio SIGTSTP listener on `Process::wait` to detect when
-			// its children have been stopped (`crates/brush-core-vendored/src/sys/
+			// its children have been stopped (`crates/vendor/brush-core/src/sys/
 			// unix/signal.rs::tstp_signal_listener` → `tokio::signal::unix::
 			// signal(SIGTSTP)`). Per tokio's documented contract, the first call
 			// for a given SignalKind permanently replaces the kernel-default
@@ -982,7 +1027,7 @@ export class InputController {
 			// children that must survive the suspend (MCP stdio servers via
 			// the `detached: true` spawn in `mcp/transports/stdio.ts`, every
 			// brush external command via brush's per-child `setsid` in
-			// `crates/brush-core-vendored/src/commands.rs`) are already in
+			// `crates/vendor/brush-core/src/commands.rs`) are already in
 			// their own sessions, so pgid=0 does not reach them.
 			process.kill(0, "SIGSTOP");
 		} catch (err) {
@@ -1008,59 +1053,52 @@ export class InputController {
 
 	/**
 	 * Dispatch a `/skill:<name> [args]` invocation through `promptCustomMessage`
-	 * using the supplied `streamingBehavior`. Returns true if the text was a
-	 * recognised skill command and was dispatched. A failure to load the skill
-	 * file is surfaced via `showError` but still returns true — the editor was
-	 * already cleared on the success path, so falling through to plain-text
-	 * handling at that point would double-submit. Returns false when the text
-	 * isn't a `/skill:` prefix or the command name isn't a registered skill,
-	 * so the caller can fall through to plain-text handling (this branch
-	 * leaves the editor state untouched). `streamingBehavior` is only consulted
-	 * while the agent is streaming; the idle path of `promptCustomMessage`
-	 * ignores it.
+	 * using the supplied `streamingBehavior`. Returns false when the text is not
+	 * a registered skill command and leaves the editor state untouched. Registered
+	 * skills consume the full composer draft (text plus pending images) before
+	 * dispatch; if dispatch rejects, the draft is restored so the user can retry.
 	 */
-	async #invokeSkillCommand(text: string, streamingBehavior: "steer" | "followUp"): Promise<boolean> {
-		if (!text.startsWith("/skill:")) return false;
-		const spaceIndex = text.indexOf(" ");
-		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
-		const skillPath = this.ctx.skillCommands?.get(commandName);
-		if (!skillPath) return false;
-		this.ctx.editor.addToHistory(text);
-		this.ctx.editor.setText("");
-		try {
-			const content = await Bun.file(skillPath).text();
-			const body = content.replace(/^---\n[\s\S]*?\n---\n/, "").trim();
-			const metaLines = [`Skill: ${skillPath}`];
-			if (args) {
-				metaLines.push(`User: ${args}`);
+	async #invokeSkillCommand(
+		text: string,
+		streamingBehavior: "steer" | "followUp",
+		images?: ImageContent[],
+		imageLinks?: (string | undefined)[],
+	): Promise<boolean> {
+		if (!isKnownSkillCommand(this.ctx, text)) return false;
+		const draftImages = images && images.length > 0 ? [...images] : undefined;
+		const draftImageLinks = draftImages && imageLinks && imageLinks.length > 0 ? [...imageLinks] : undefined;
+		const restoreDraft = () => {
+			this.ctx.editor.setText(text);
+			if (draftImages && draftImages.length > 0) {
+				this.ctx.editor.pendingImages = [...draftImages];
+				this.ctx.editor.pendingImageLinks = draftImageLinks
+					? [...draftImageLinks]
+					: draftImages.map(() => undefined);
+				this.ctx.editor.imageLinks = this.ctx.editor.pendingImageLinks;
 			}
-			const message = `${body}\n\n---\n\n${metaLines.join("\n")}`;
-			const skillName = commandName.slice("skill:".length);
-			const details: SkillPromptDetails = {
-				name: skillName || commandName,
-				path: skillPath,
-				args: args || undefined,
-				lineCount: body ? body.split("\n").length : 0,
-			};
-			await this.ctx.session.promptCustomMessage(
-				{
-					customType: SKILL_PROMPT_MESSAGE_TYPE,
-					content: message,
-					display: true,
-					details,
-					attribution: "user",
-				},
-				{ streamingBehavior, queueChipText: text },
-			);
+		};
+
+		this.ctx.editor.clearDraft(text);
+		try {
+			const handled = await invokeSkillCommandFromText(this.ctx, text, streamingBehavior, {
+				images: draftImages,
+				propagateErrors: true,
+			});
+			if (!handled) {
+				restoreDraft();
+				return false;
+			}
+			return true;
+		} catch (error) {
+			restoreDraft();
+			this.ctx.showError(error instanceof Error ? error.message : String(error));
+			return true;
+		} finally {
 			if (this.ctx.session.isStreaming) {
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();
 			}
-		} catch (err) {
-			this.ctx.showError(`Failed to load skill: ${err instanceof Error ? err.message : String(err)}`);
 		}
-		return true;
 	}
 
 	async handleRetry(): Promise<void> {
@@ -1078,7 +1116,7 @@ export class InputController {
 
 	/** Send editor text as a follow-up message (queued behind current stream). */
 	async handleFollowUp(): Promise<void> {
-		let text = this.ctx.editor.getText().trim();
+		let text = this.ctx.editor.getExpandedText().trim();
 		const images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
 		const imageLinks =
 			images && this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
@@ -1093,9 +1131,8 @@ export class InputController {
 		// Compaction first: while compacting, free text gets queued via
 		// `queueCompactionMessage`, and `/skill:*` rides the same queue so a
 		// skill typed during compaction is not lost or short-circuited through
-		// `promptCustomMessage`. The skill text is queued verbatim; whether
-		// the queued entry is later re-parsed into a skill invocation is a
-		// separate concern owned by the compaction-resume path.
+		// `promptCustomMessage`. The compaction-resume path re-parses the
+		// queued text into a user-attributed skill invocation before delivery.
 		if (this.ctx.session.isCompacting) {
 			const images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
 			this.ctx.queueCompactionMessage(text, "followUp", images);
@@ -1121,7 +1158,7 @@ export class InputController {
 		// Skill commands invoke through the custom-message path regardless of
 		// which keybinding submitted them. Enter routes them as `steer`;
 		// Ctrl+Enter (this handler) routes them as `followUp`.
-		if (text && (await this.#invokeSkillCommand(text, "followUp"))) {
+		if (text && (await this.#invokeSkillCommand(text, "followUp", images, imageLinks))) {
 			return;
 		}
 
@@ -1386,33 +1423,65 @@ export class InputController {
 	async handleImagePaste(): Promise<boolean> {
 		try {
 			const image = await this.clipboard.readImage();
-			if (!image) {
-				// Smart paste (#1628): no image on the clipboard — fall back to
-				// pasting its text so the same chord covers both payload kinds.
-				// Hosts that pre-empt the terminal's own paste (VS Code's
-				// integrated terminal, Win+V clipboard history) deliver only
-				// this keypress, so a miss here must not dead-end.
-				const text = await this.clipboard.readText();
-				if (!text) {
-					this.ctx.showStatus("Clipboard is empty");
-					return false;
-				}
-				// Route to the focused component when it accepts pastes (modal
-				// Input prompts), matching the enhanced-paste text path (#2127).
-				const focused = this.ctx.ui.getFocused();
-				const target = focused && focused !== this.ctx.editor && hasPasteText(focused) ? focused : this.ctx.editor;
-				target.pasteText(text);
-				this.ctx.ui.requestRender();
+			if (image) {
+				return await this.#normalizeAndInsertPastedImage(
+					{
+						type: "image",
+						data: image.data.toBase64(),
+						mimeType: image.mimeType,
+					},
+					`Unsupported clipboard image format: ${image.mimeType}`,
+				);
+			}
+			// #3506: macOS Finder `Cmd+C` puts only a `public.file-url`
+			// representation on the pasteboard. `pbpaste` (the backing call
+			// for `readText` on Darwin) only surfaces plain text / RTF / EPS,
+			// so it returns empty for file-url-only pasteboards — the smart
+			// text fallback below would dead-end with "Clipboard is empty".
+			// Reach the file URL directly via AppleScript and route every
+			// image-shaped path through {@link handleImagePathPaste}, matching
+			// the bracketed-paste handler in `CustomEditor.handleInput` which
+			// iterates every extracted image path. Multi-image Finder
+			// selections must not silently drop after the first attach.
+			// `readMacFileUrls` returns an empty list off Darwin, so the
+			// check is free on every other platform.
+			const fileUrls = (await this.clipboard.readMacFileUrls?.()) ?? [];
+			let attachedFromFileUrls = false;
+			for (const url of fileUrls) {
+				const candidate = extractImagePathFromText(url);
+				if (!candidate) continue;
+				await this.handleImagePathPaste(candidate);
+				attachedFromFileUrls = true;
+			}
+			if (attachedFromFileUrls) return true;
+			// Smart paste (#1628): no image on the clipboard — fall back to
+			// pasting its text so the same chord covers both payload kinds.
+			// Hosts that pre-empt the terminal's own paste (VS Code's
+			// integrated terminal, Win+V clipboard history) deliver only
+			// this keypress, so a miss here must not dead-end.
+			const text = await this.clipboard.readText();
+			if (!text) {
+				this.ctx.showStatus("Clipboard is empty");
+				return false;
+			}
+			// #3506: when the clipboard text is an explicit image file path,
+			// route through {@link handleImagePathPaste} so the image is
+			// loaded and attached instead of pasting the path as literal
+			// text. Covers terminals that paste the Finder file path as
+			// plain text rather than as a `public.file-url` (most macOS
+			// terminals do this for image clipboards).
+			const imagePath = extractImagePathFromText(text);
+			if (imagePath) {
+				await this.handleImagePathPaste(imagePath);
 				return true;
 			}
-			return await this.#normalizeAndInsertPastedImage(
-				{
-					type: "image",
-					data: image.data.toBase64(),
-					mimeType: image.mimeType,
-				},
-				`Unsupported clipboard image format: ${image.mimeType}`,
-			);
+			// Route to the focused component when it accepts pastes (modal
+			// Input prompts), matching the enhanced-paste text path (#2127).
+			const focused = this.ctx.ui.getFocused();
+			const target = focused && focused !== this.ctx.editor && hasPasteText(focused) ? focused : this.ctx.editor;
+			target.pasteText(text);
+			this.ctx.ui.requestRender();
+			return true;
 		} catch {
 			this.ctx.showStatus("Failed to read clipboard");
 			return false;
@@ -1641,6 +1710,17 @@ export class InputController {
 	}
 
 	toggleThinkingBlockVisibility(): void {
+		// When thinking is "off" and the session has not produced reasoning
+		// content, thinking blocks stay auto-hidden; the toggle would only corrupt
+		// the persisted preference. OpenAI-compatible servers can stream reasoning
+		// without advertising model support, so observed thinking content unlocks
+		// the display toggle.
+		const thinkingOff =
+			((this.ctx.viewSession ?? this.ctx.session)?.thinkingLevel ?? ThinkingLevel.Off) === ThinkingLevel.Off;
+		if (thinkingOff && !this.ctx.hasDisplayableThinkingContent) {
+			this.ctx.showStatus("Thinking is off — enable thinking to show blocks");
+			return;
+		}
 		this.ctx.hideThinkingBlock = !this.ctx.hideThinkingBlock;
 		this.ctx.settings.set("hideThinkingBlock", this.ctx.hideThinkingBlock);
 

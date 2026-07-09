@@ -13,11 +13,13 @@ Every file section starts with `[PATH#TAG]`. `TAG` = 4-hex snapshot tag from you
 `INS.POST N:` — insert the body rows immediately after line N.
 `INS.BLK.POST N:` — insert the body rows after the END of the block that BEGINS on line N — outside it, at sibling depth. To append inside a block, use `INS.POST`.
 `INS.HEAD:` / `INS.TAIL:` — insert the body rows at the very start / end of the file.
+`REM` — delete the whole file named by the section header. No body, no line ops.
+`MV DEST` — move/rename the section file to `DEST` (a path, quoted when it contains spaces). Line edits above `MV` land on the source first, then the final content is written at `DEST`.
 Single line: `SWAP N.=N:` / `DEL N`. The range is the ORIGINAL lines you touch; body length is irrelevant (replacing 1 line with 10 is still `SWAP N.=N:`).
 </ops>
 
 <body-rows>
-Body rows appear only under a `:` header. Every body row is `+TEXT` — add a literal line `TEXT`, verbatim (leading whitespace kept); `+` alone adds a blank line. No other row kind. NEVER write `-old` or a bare/context line. To keep a line, leave it out of every range. To insert a literal line starting with `-` or `+`, prefix it: `+-x`, `++x`.
+Body rows appear only under a `:` header. Every body row is `+TEXT` — add a literal line `TEXT`, verbatim (leading whitespace kept); `+` alone adds a blank line. No other row kind. NEVER write `-old` or a bare/context line. To keep a line, leave it out of every range. Literal lines starting with `-`/`+` still need the body prefix: Markdown `- item` → `+- item`, `+ item` → `++ item`.
 </body-rows>
 
 <rules>
@@ -34,6 +36,7 @@ Body rows appear only under a `:` header. Every body row is `+TEXT` — add a li
 - Whole construct → `SWAP.BLK N` (tree-sitter resolves the end); lines inside it → `SWAP N.=M`.
 - `SWAP.BLK N` resolves EXACTLY the node at N. Leading decorators/attributes/doc-comments are separate nodes: point N at the FIRST decorator to sweep both; standalone line-comments are never swept — use `SWAP N.=M`.
 - Block ops (`SWAP.BLK`/`DEL.BLK`/`INS.BLK.POST`) anchor the OPENING line of a MULTI-LINE construct — never its closer, last line, or a bare inner statement. Anchoring one statement resolves to ONE line and is REJECTED: use the plain op (`SWAP N.=N` / `DEL N` / `INS.POST N`), or point N at the real opener. Saw the closer? Use plain `INS.POST M:`.
+- Markdown: a heading line IS a block opener — `SWAP.BLK`/`DEL.BLK`/`INS.BLK.POST` on a `##`/`###` heading resolves its WHOLE section (heading through every nested deeper heading, up to the next same-or-higher heading). So `DEL.BLK` drops the section, `SWAP.BLK` rewrites it, `INS.BLK.POST` lands after it (end the inserted body with a blank line to keep the next heading separated).
 - Non-adjacent changes = separate hunks; untouched lines stay out of every range.
 - Pure additions use `INS.PRE` / `INS.POST` / `INS.HEAD` / `INS.TAIL`, never a widened `SWAP` — retyped keepers are exactly what gets dropped. (A multi-line `SWAP` whose body restates the line just past the range is auto-dropped as an off-by-one keeper with a warning — issue the payload for the range only; never lean on the repair.)
 - NEVER format/restyle code with this tool; run the project formatter instead.
@@ -70,6 +73,27 @@ Delete line 3:
 DEL 3
 ```
 
+Delete the whole file:
+```
+[greet.py#A1B2]
+REM
+```
+
+Rename or move the file:
+```
+[greet.py#A1B2]
+MV greet_v2.py
+```
+
+Move after editing:
+```
+[greet.py#A1B2]
+SWAP 1.=3:
++def greet(name):
++    print(f"Hi, {name}")
+MV lib/greet.py
+```
+
 Add a header and trailer:
 ```
 [greet.py#A1B2]
@@ -77,6 +101,14 @@ INS.HEAD:
 +# generated header
 INS.TAIL:
 +greet("everyone")
+```
+
+Insert Markdown bullets — the leading `+` is the body-row marker; the file receives `- task`:
+```
+[PLAN.md#A1B2]
+INS.POST 2:
++- task
++  - nested task
 ```
 
 Replace the whole `greet` function block — `SWAP.BLK 1:` resolves lines 1–3 (the `def` header through `print(msg)`); line 4 is a separate statement and stays:
@@ -136,5 +168,5 @@ INS.POST 3:
 If you remember nothing else:
 1. RE-GROUND AFTER EVERY EDIT. Every apply mints a fresh `#TAG` and renumbers — take the next edit's numbers from the edit response or a fresh `read`. Stale tag or surprise? STOP, re-`read`.
 2. RANGES ARE TIGHT. Cover only lines that change; a stale wide range shreds everything it spans. Whole construct → `SWAP.BLK N`.
-3. THE BODY IS THE FINAL CONTENT. Only `+TEXT` rows; never `-old`/context lines. The range does the deleting.
+3. THE BODY IS THE FINAL CONTENT. Every body row starts with `+`; Markdown bullets use `+- item`, not `- item`.
 </critical>

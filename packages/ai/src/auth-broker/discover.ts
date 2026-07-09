@@ -1,6 +1,6 @@
 /**
  * Broker-aware auth-storage discovery used by both the coding-agent runtime and
- * the catalog model generator. Keeps the precedence logic (env → config.yml →
+ * the catalog model generator. Keeps the precedence logic (env → config.yml/config.yaml →
  * token file → local SQLite) in one place so build-time tooling sees the same
  * credentials as the TUI.
  */
@@ -12,9 +12,11 @@ import {
 	getConfigRootDir,
 	isEnoent,
 	logger,
+	MAIN_CONFIG_FILENAMES,
 } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 import { AuthStorage } from "../auth-storage";
+import * as AIError from "../error";
 import { AuthBrokerClient } from "./client";
 import { RemoteAuthCredentialStore } from "./remote-store";
 import { readAuthBrokerSnapshotCache, writeAuthBrokerSnapshotCache } from "./snapshot-cache";
@@ -71,21 +73,24 @@ interface ConfigSnapshot {
 }
 
 async function readConfigYaml(agentDir: string): Promise<ConfigSnapshot> {
-	const configPath = path.join(agentDir, "config.yml");
-	try {
-		const raw = await Bun.file(configPath).text();
-		const parsed = YAML.parse(raw);
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-		const record = parsed as Record<string, unknown>;
-		const url = typeof record["auth.broker.url"] === "string" ? (record["auth.broker.url"] as string) : undefined;
-		const token =
-			typeof record["auth.broker.token"] === "string" ? (record["auth.broker.token"] as string) : undefined;
-		return { url, token };
-	} catch (err) {
-		if (isEnoent(err)) return {};
-		logger.warn("auth-broker config.yml unreadable", { error: String(err) });
-		return {};
+	for (const filename of MAIN_CONFIG_FILENAMES) {
+		const configPath = path.join(agentDir, filename);
+		try {
+			const raw = await Bun.file(configPath).text();
+			const parsed = YAML.parse(raw);
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+			const record = parsed as Record<string, unknown>;
+			const url = typeof record["auth.broker.url"] === "string" ? (record["auth.broker.url"] as string) : undefined;
+			const token =
+				typeof record["auth.broker.token"] === "string" ? (record["auth.broker.token"] as string) : undefined;
+			return { url, token };
+		} catch (err) {
+			if (isEnoent(err)) continue;
+			logger.warn("auth-broker config unreadable", { path: configPath, error: String(err) });
+			return {};
+		}
 	}
+	return {};
 }
 
 function resolveSnapshotTtlMs(): number {
@@ -103,7 +108,7 @@ function resolveSnapshotTtlMs(): number {
  * Resolve broker connection configuration using the same precedence as the TUI:
  *
  * 1. `OMP_AUTH_BROKER_URL` / `OMP_AUTH_BROKER_TOKEN` env vars.
- * 2. `auth.broker.url` / `auth.broker.token` in `<agentDir>/config.yml`.
+ * 2. `auth.broker.url` / `auth.broker.token` in `<agentDir>/config.yml` or `<agentDir>/config.yaml`.
  * 3. `<config-root>/auth-broker.token` file (paired with a URL from env/config).
  *
  * Returns `null` when no broker URL is configured — callers should fall back to
@@ -137,7 +142,8 @@ export async function resolveAuthBrokerConfig(
 	const token =
 		(envToken && envToken.length > 0 ? envToken : undefined) ?? configToken ?? (await readTokenFile()) ?? undefined;
 	if (!token) {
-		throw new Error(
+		throw new AIError.MissingApiKeyError(
+			undefined,
 			`OMP_AUTH_BROKER_URL is set (${url}) but no bearer token is available. ` +
 				`Set OMP_AUTH_BROKER_TOKEN, the \`auth.broker.token\` config entry, or place one at ${getAuthBrokerTokenFilePath()}.`,
 		);
@@ -190,7 +196,10 @@ export async function discoverAuthStorage(options: DiscoverAuthStorageOptions = 
 		}
 		if (!initialSnapshot) {
 			const initialResult = await client.fetchSnapshot();
-			if (initialResult.status !== 200) throw new Error("Auth broker returned no initial snapshot");
+			if (initialResult.status !== 200)
+				throw new AIError.AuthBrokerError("Auth broker returned no initial snapshot", {
+					status: initialResult.status,
+				});
 			initialSnapshot = initialResult.snapshot;
 			persist?.(initialSnapshot);
 		}

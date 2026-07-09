@@ -4,8 +4,10 @@ import { alibabaCodingPlanProvider } from "./alibaba-coding-plan";
 import { amazonBedrockProvider } from "./amazon-bedrock";
 import { anthropicProvider } from "./anthropic";
 import { azureProvider } from "./azure";
+import { basetenProvider } from "./baseten";
 import { cerebrasProvider } from "./cerebras";
 import { cloudflareAiGatewayProvider } from "./cloudflare-ai-gateway";
+import { coreWeaveProvider } from "./coreweave";
 import { cursorProvider } from "./cursor";
 import { deepseekProvider } from "./deepseek";
 import { devinProvider } from "./devin";
@@ -13,6 +15,7 @@ import { firepassProvider } from "./firepass";
 import { fireworksProvider } from "./fireworks";
 import { githubCopilotProvider } from "./github-copilot";
 import { gitlabDuoProvider } from "./gitlab-duo";
+import { gitLabDuoWorkflowProvider } from "./gitlab-duo-workflow";
 import { googleProvider } from "./google";
 import { googleAntigravityProvider } from "./google-antigravity";
 import { googleGeminiCliProvider } from "./google-gemini-cli";
@@ -86,6 +89,7 @@ const ALL = [
 	openaiCodexDeviceProvider,
 	xaiOauthProvider,
 	gitlabDuoProvider,
+	gitLabDuoWorkflowProvider,
 	alibabaCodingPlanProvider,
 	aimlApiProvider,
 	zhipuCodingPlanProvider,
@@ -102,6 +106,7 @@ const ALL = [
 	deepseekProvider,
 	moonshotProvider,
 	cerebrasProvider,
+	basetenProvider,
 	fireworksProvider,
 	togetherProvider,
 	nvidiaProvider,
@@ -112,6 +117,7 @@ const ALL = [
 	syntheticProvider,
 	nanogptProvider,
 	waferServerlessProvider,
+	coreWeaveProvider,
 	vercelAiGatewayProvider,
 	cloudflareAiGatewayProvider,
 	litellmProvider,

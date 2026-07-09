@@ -14,6 +14,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { configureProviderMaxInFlightRequests } from "@oh-my-pi/pi-ai/stream";
 import {
 	getAgentDbPath,
 	getAgentDir,
@@ -21,7 +22,9 @@ import {
 	getProjectDir,
 	isEnoent,
 	logger,
+	MAIN_CONFIG_FILENAMES,
 	procmgr,
+	setWorktreesDir,
 } from "@oh-my-pi/pi-utils";
 import { JSONC, YAML } from "bun";
 import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
@@ -29,6 +32,7 @@ import type { ModelRole } from "../config/model-roles";
 import { loadCapability } from "../discovery";
 import { isLightTheme, setAutoThemeMapping, setColorBlindMode, setSymbolPreset } from "../modes/theme/theme";
 import { AgentStorage } from "../session/agent-storage";
+import { normalizeToolName } from "../tools/builtin-names";
 import { type EditMode, normalizeEditMode } from "../utils/edit-mode";
 import { withFileLock } from "./file-lock";
 import {
@@ -57,10 +61,12 @@ export interface RawSettings {
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
 	cwd?: string;
-	/** Agent directory for config.yml storage */
+	/** Agent directory for config.yml/config.yaml storage */
 	agentDir?: string;
 	/** Don't persist to disk (for tests) */
 	inMemory?: boolean;
+	/** Read config sources without opening storage or writing migrations */
+	readOnly?: boolean;
 	/** Initial overrides */
 	overrides?: Partial<Record<SettingPath, unknown>>;
 	/** Extra config.yml-style overlays loaded after global/project settings */
@@ -105,6 +111,33 @@ function setByPath(obj: RawSettings, segments: string[], value: unknown): void {
 	current[segments[segments.length - 1]] = value;
 }
 
+export function normalizeProviderMaxInFlightRequests(value: unknown): Record<string, number> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const normalized: Record<string, number> = {};
+	for (const [provider, rawLimit] of Object.entries(value)) {
+		if (typeof rawLimit !== "number" || !Number.isFinite(rawLimit) || rawLimit <= 0) continue;
+		normalized[provider] = Math.max(1, Math.floor(rawLimit));
+	}
+	return normalized;
+}
+
+export function validateProviderMaxInFlightRequests(value: unknown): Record<string, number> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const invalidProviders: string[] = [];
+	const normalized: Record<string, number> = {};
+	for (const [provider, rawLimit] of Object.entries(value)) {
+		if (typeof rawLimit !== "number" || !Number.isFinite(rawLimit) || rawLimit <= 0) {
+			invalidProviders.push(provider);
+			continue;
+		}
+		normalized[provider] = Math.max(1, Math.floor(rawLimit));
+	}
+	if (invalidProviders.length > 0) {
+		throw new Error(`Provider request limits must be positive numbers: ${invalidProviders.join(", ")}`);
+	}
+	return normalized;
+}
+
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
 type PathScopedStringArrayEntry = {
 	path?: unknown;
@@ -136,17 +169,22 @@ function stringArrayFromUnknown(value: unknown): string[] {
 	return [];
 }
 
-function shallowStringRecord(value: unknown): Record<string, string> {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-
-	const result: Record<string, string> = {};
-	for (const [key, item] of Object.entries(value)) {
-		if (typeof item === "string") {
-			result[key] = item;
-		}
-	}
-	return result;
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
 }
+
+function modelRoleValueFromUnknown(value: unknown): string | undefined {
+	if (typeof value === "string") return value;
+	if (!Array.isArray(value)) return undefined;
+
+	const entries = stringArrayFromUnknown(value);
+	return entries.length === value.length ? entries.join(",") : undefined;
+}
+
+type EditVariantEntry = {
+	patternLower: string;
+	mode: EditMode;
+};
 
 function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, cwd: string): string[] | undefined {
 	if (!PATH_SCOPED_ARRAY_SETTINGS.has(settingPath) || !Array.isArray(value)) return undefined;
@@ -197,7 +235,7 @@ export class Settings {
 	#storage: AgentStorage | null = null;
 
 	#configFiles: string[] = [];
-	/** Global settings from config.yml */
+	/** Global settings from config.yml/config.yaml */
 	#global: RawSettings = {};
 	/** Project settings from .claude/settings.yml etc */
 	#project: RawSettings = {};
@@ -209,6 +247,7 @@ export class Settings {
 	#merged: RawSettings = {};
 	/** Cached resolved values from the merged view, including defaults/path scoping */
 	#resolvedCache = new Map<SettingPath, unknown>();
+	#editVariantCache: readonly EditVariantEntry[] | undefined;
 
 	/** Paths modified during this session (for partial save) */
 	#modified = new Set<string>();
@@ -226,9 +265,9 @@ export class Settings {
 	private constructor(options: SettingsOptions = {}) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
-		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, "config.yml");
+		this.#configPath = options.inMemory ? null : path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
 		this.#configFiles = options.configFiles?.map(file => path.resolve(this.#cwd, expandTilde(file))) ?? [];
-		this.#persist = !options.inMemory;
+		this.#persist = !options.inMemory && options.readOnly !== true;
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
@@ -268,6 +307,23 @@ export class Settings {
 				throw error;
 			},
 		);
+	}
+
+	/**
+	 * Load effective settings from config.yml and project providers without
+	 * opening agent.db, migrating legacy settings, or writing marker files.
+	 */
+	static loadReadOnly(options: SettingsOptions = {}): Promise<Settings> {
+		const instance = new Settings({ ...options, readOnly: true });
+		return instance.#loadReadOnly();
+	}
+
+	/**
+	 * Load a persisted settings instance without touching the global singleton.
+	 */
+	static loadIsolated(options: SettingsOptions = {}): Promise<Settings> {
+		const instance = new Settings(options);
+		return instance.#load();
 	}
 
 	/**
@@ -336,7 +392,7 @@ export class Settings {
 		// Trigger hook if exists
 		const hook = SETTING_HOOKS[path];
 		if (hook) {
-			hook(value, prev);
+			hook(next, prev);
 		}
 		this.#fireEffectiveSettingChanged(path, next, prev);
 	}
@@ -374,6 +430,9 @@ export class Settings {
 		if (path === "statusLine.sessionAccent") {
 			statusLineSessionAccentSignal.fire();
 		}
+		if (path === "modelRoles") {
+			modelRolesSignal.fire();
+		}
 	}
 
 	/**
@@ -400,6 +459,7 @@ export class Settings {
 			inMemory: !this.#persist,
 		});
 		cloned.#storage = this.#storage;
+		cloned.#configPath = this.#configPath;
 		cloned.#global = structuredClone(this.#global);
 		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
 		cloned.#configFiles = [...this.#configFiles];
@@ -425,11 +485,13 @@ export class Settings {
 	async reloadForCwd(cwd: string): Promise<void> {
 		const normalized = path.normalize(cwd);
 		if (normalized === this.#cwd) return;
+		const prevModelRoles = this.get("modelRoles");
 		this.#cwd = normalized;
 		if (this.#persist) {
 			this.#project = await this.#loadProjectSettings();
 		}
 		this.#rebuildMerged();
+		this.#fireEffectiveSettingChanged("modelRoles", this.get("modelRoles"), prevModelRoles);
 		this.#fireAllHooks();
 	}
 
@@ -481,17 +543,42 @@ export class Settings {
 	 */
 	getEditVariantForModel(model: string | undefined): EditMode | null {
 		if (!model) return null;
-		const variants = (this.#merged.edit as { modelVariants?: Record<string, string> })?.modelVariants;
-		if (!variants) return null;
-		for (const pattern in variants) {
-			if (model.includes(pattern)) {
-				const value = normalizeEditMode(variants[pattern]);
-				if (value) {
-					return value;
-				}
+		const variants = this.#getEditVariantEntries();
+		if (variants.length === 0) return null;
+
+		const modelLower = model.toLowerCase();
+
+		for (let i = 0; i < variants.length; i++) {
+			const variant = variants[i];
+			if (modelLower.includes(variant.patternLower)) {
+				return variant.mode;
 			}
 		}
 		return null;
+	}
+
+	#getEditVariantEntries(): readonly EditVariantEntry[] {
+		if (this.#editVariantCache !== undefined) return this.#editVariantCache;
+
+		const value = getByPath(this.#merged, ["edit", "modelVariants"]);
+		if (!isRecord(value)) {
+			this.#editVariantCache = [];
+			return this.#editVariantCache;
+		}
+
+		const variants: EditVariantEntry[] = [];
+		for (const pattern in value) {
+			if (!Object.hasOwn(value, pattern)) continue;
+			const rawMode = value[pattern];
+			if (typeof rawMode !== "string") continue;
+			const mode = normalizeEditMode(rawMode);
+			if (mode) {
+				variants.push({ patternLower: pattern.toLowerCase(), mode });
+			}
+		}
+
+		this.#editVariantCache = variants;
+		return variants;
 	}
 
 	/**
@@ -501,11 +588,26 @@ export class Settings {
 		return this.get("bashInterceptor.patterns");
 	}
 
+	#modelRolesFromLayer(layer: RawSettings): Record<string, string> {
+		const value = getByPath(layer, ["modelRoles"]);
+		if (!isRecord(value)) return {};
+
+		const roles: Record<string, string> = {};
+		for (const role in value) {
+			if (!Object.hasOwn(value, role)) continue;
+			const modelId = modelRoleValueFromUnknown(value[role]);
+			if (modelId !== undefined) {
+				roles[role] = modelId;
+			}
+		}
+		return roles;
+	}
+
 	/**
 	 * Set a model role (helper for modelRoles record).
 	 */
 	setModelRole(role: ModelRole | string, modelId: string): void {
-		const current = shallowStringRecord(getByPath(this.#global, ["modelRoles"]));
+		const current = this.#modelRolesFromLayer(this.#global);
 		const runtimeOverrides = getByPath(this.#overrides, ["modelRoles"]);
 		const updateRuntimeOverride =
 			!!runtimeOverrides &&
@@ -513,10 +615,13 @@ export class Settings {
 			!Array.isArray(runtimeOverrides) &&
 			Object.hasOwn(runtimeOverrides, role);
 
-		this.set("modelRoles", { ...current, [role]: modelId });
+		current[role] = modelId;
+		this.set("modelRoles", current);
 
 		if (updateRuntimeOverride) {
-			this.override("modelRoles", { ...shallowStringRecord(runtimeOverrides), [role]: modelId });
+			const nextRuntimeOverride = this.#modelRolesFromLayer(this.#overrides);
+			nextRuntimeOverride[role] = modelId;
+			this.override("modelRoles", nextRuntimeOverride);
 		}
 	}
 
@@ -524,22 +629,34 @@ export class Settings {
 	 * Get a model role (helper for modelRoles record).
 	 */
 	getModelRole(role: ModelRole | string): string | undefined {
-		const roles = this.get("modelRoles");
-		return roles[role];
+		const roles: unknown = this.get("modelRoles");
+		if (!isRecord(roles)) return undefined;
+		return modelRoleValueFromUnknown(roles[role]);
 	}
 
 	/**
 	 * Get all model roles (helper for modelRoles record).
 	 */
 	getModelRoles(): ReadOnlyDict<string> {
-		return { ...this.get("modelRoles") };
+		const roles: unknown = this.get("modelRoles");
+		if (!isRecord(roles)) return {};
+
+		const normalized: Record<string, string> = {};
+		for (const role in roles) {
+			if (!Object.hasOwn(roles, role)) continue;
+			const modelId = modelRoleValueFromUnknown(roles[role]);
+			if (modelId !== undefined) {
+				normalized[role] = modelId;
+			}
+		}
+		return normalized;
 	}
 
 	/*
 	 * Override model roles (helper for modelRoles record).
 	 */
 	overrideModelRoles(roles: ReadOnlyDict<string>): void {
-		const next = shallowStringRecord(getByPath(this.#overrides, ["modelRoles"]));
+		const next = this.#modelRolesFromLayer(this.#overrides);
 		for (const [role, modelId] of Object.entries(roles)) {
 			if (modelId) {
 				next[role] = modelId;
@@ -561,16 +678,22 @@ export class Settings {
 
 	async #load(): Promise<Settings> {
 		// Project settings load (loadCapability scans cwd) is independent of the
-		// persist chain (storage open → legacy migration → global config.yml read),
-		// so kick it off first and await after the persist chain completes. The
-		// persist steps remain sequential: migration may write config.yml, which
-		// #loadYaml then reads; migration's db fallback needs #storage opened.
+		// persist chain (storage open → legacy migration → global config read), so
+		// kick it off first and await after the persist chain completes. The
+		// persist steps remain sequential: existing config discovery decides
+		// whether migration may write config.yml before the global config is read;
+		// migration's db fallback needs #storage opened.
 		const projectPromise = this.#loadProjectSettings();
 
 		if (this.#persist) {
 			this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
-			await this.#migrateFromLegacy();
-			this.#global = await this.#loadYaml(this.#configPath!);
+			const existingConfig = await this.#loadExistingMainYaml();
+			if (existingConfig) {
+				this.#global = existingConfig;
+			} else {
+				await this.#migrateFromLegacy();
+				this.#global = await this.#loadYaml(this.#configPath!);
+			}
 			await this.#seedLastChangelogVersionMarker();
 		}
 
@@ -583,19 +706,59 @@ export class Settings {
 		return this;
 	}
 
+	async #loadReadOnly(): Promise<Settings> {
+		const projectPromise = this.#loadProjectSettings();
+
+		const existingConfig = await this.#loadExistingMainYaml();
+		if (existingConfig) {
+			this.#global = existingConfig;
+		}
+
+		this.#project = await projectPromise;
+		this.#configOverlay = await this.#loadConfigOverlays();
+		this.#rebuildMerged();
+		return this;
+	}
+
 	async #loadYaml(filePath: string): Promise<RawSettings> {
+		const loaded = await this.#loadYamlIfPresent(filePath);
+		return loaded ?? {};
+	}
+
+	async #loadYamlIfPresent(filePath: string): Promise<RawSettings | null> {
+		let content: string;
 		try {
-			const content = await Bun.file(filePath).text();
+			content = await Bun.file(filePath).text();
+		} catch (error) {
+			if (isEnoent(error)) return null;
+			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
+			return {};
+		}
+
+		try {
 			const parsed = YAML.parse(content);
 			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
 				return {};
 			}
 			return this.#migrateRawSettings(parsed as RawSettings);
 		} catch (error) {
-			if (isEnoent(error)) return {};
 			logger.warn("Settings: failed to load", { path: filePath, error: String(error) });
 			return {};
 		}
+	}
+
+	async #loadExistingMainYaml(): Promise<RawSettings | null> {
+		if (!this.#configPath) return null;
+		for (const filename of MAIN_CONFIG_FILENAMES) {
+			const configPath = path.join(this.#agentDir, filename);
+			const loaded = await this.#loadYamlIfPresent(configPath);
+			if (loaded) {
+				this.#configPath = configPath;
+				return loaded;
+			}
+		}
+		this.#configPath = path.join(this.#agentDir, MAIN_CONFIG_FILENAMES[0]);
+		return null;
 	}
 
 	async #loadProjectSettings(): Promise<RawSettings> {
@@ -652,14 +815,6 @@ export class Settings {
 
 	async #migrateFromLegacy(): Promise<void> {
 		if (!this.#configPath) return;
-
-		// Check if config.yml already exists
-		try {
-			await Bun.file(this.#configPath).text();
-			return; // Already exists, no migration needed
-		} catch (err) {
-			if (!isEnoent(err)) return;
-		}
 
 		let settings: RawSettings = {};
 		let migrated = false;
@@ -816,6 +971,14 @@ export class Settings {
 			raw["snapcompact.systemPrompt"] = raw["snapcompact.systemPrompt"] ? "all" : "none";
 		}
 
+		// inlineToolDescriptors: boolean -> enum (auto | on | off). The old
+		// `true`/`false` mapped directly onto inline-on/inline-off, so preserve
+		// the user's explicit choice; new installs get the `auto` default that
+		// turns it on only for Gemini models.
+		if (typeof raw.inlineToolDescriptors === "boolean") {
+			raw.inlineToolDescriptors = raw.inlineToolDescriptors ? "on" : "off";
+		}
+
 		// statusLine: rename "plan_mode" segment to "mode"
 		const statusLineObj = raw.statusLine as Record<string, unknown> | undefined;
 		if (statusLineObj) {
@@ -949,10 +1112,175 @@ export class Settings {
 			delete raw["power.preventDisplaySleep"];
 		}
 
+		// Migration for renamed settings grep.* and glob.* from search.* and find.*:
+		// 1. Nested settings: find -> glob, search -> grep (per-property merge to avoid clobbering)
+		const ensureRawObject = (key: "glob" | "grep"): Record<string, unknown> => {
+			const current = raw[key];
+			if (isRecord(current)) {
+				return current;
+			}
+			const created: Record<string, unknown> = {};
+			raw[key] = created;
+			return created;
+		};
+
+		if ("find" in raw) {
+			const findObj = raw.find;
+			if (isRecord(findObj)) {
+				const globObj = ensureRawObject("glob");
+				const findKeys: Array<"enabled"> = ["enabled"];
+				for (const key of findKeys) {
+					if (key in findObj && !(key in globObj)) {
+						globObj[key] = findObj[key];
+					}
+				}
+			}
+			delete raw.find;
+		}
+
+		if ("search" in raw) {
+			const searchObj = raw.search;
+			if (isRecord(searchObj)) {
+				const grepObj = ensureRawObject("grep");
+				const searchKeys: Array<"enabled" | "contextBefore" | "contextAfter"> = [
+					"enabled",
+					"contextBefore",
+					"contextAfter",
+				];
+				for (const key of searchKeys) {
+					if (key in searchObj && !(key in grepObj)) {
+						grepObj[key] = searchObj[key];
+					}
+				}
+			}
+			delete raw.search;
+		}
+
+		// 2. Flat settings keys: map them to the proper nested target so get/set resolves them correctly
+		if ("find.enabled" in raw) {
+			const globObj = ensureRawObject("glob");
+			if (!("enabled" in globObj)) {
+				globObj.enabled = raw["find.enabled"];
+			}
+			delete raw["find.enabled"];
+		}
+		if ("search.enabled" in raw) {
+			const grepObj = ensureRawObject("grep");
+			if (!("enabled" in grepObj)) {
+				grepObj.enabled = raw["search.enabled"];
+			}
+			delete raw["search.enabled"];
+		}
+		if ("search.contextBefore" in raw) {
+			const grepObj = ensureRawObject("grep");
+			if (!("contextBefore" in grepObj)) {
+				grepObj.contextBefore = raw["search.contextBefore"];
+			}
+			delete raw["search.contextBefore"];
+		}
+		if ("search.contextAfter" in raw) {
+			const grepObj = ensureRawObject("grep");
+			if (!("contextAfter" in grepObj)) {
+				grepObj.contextAfter = raw["search.contextAfter"];
+			}
+			delete raw["search.contextAfter"];
+		}
+
+		// 3. Tool-name arrays use wire IDs too. Preserve user overrides across
+		// the rename without duplicating entries if they already added grep/glob.
+		const migrateToolNameList = (names: unknown): unknown => {
+			if (!Array.isArray(names)) return names;
+			const out: unknown[] = [];
+			const seen = new Set<string>();
+			for (const name of names) {
+				const migrated = typeof name === "string" ? normalizeToolName(name) : name;
+				if (typeof migrated === "string") {
+					if (seen.has(migrated)) continue;
+					seen.add(migrated);
+				}
+				out.push(migrated);
+			}
+			return out;
+		};
+		const ensureToolsObject = (): Record<string, unknown> => {
+			const current = raw.tools;
+			if (current && typeof current === "object" && !Array.isArray(current)) {
+				return current as Record<string, unknown>;
+			}
+			const created: Record<string, unknown> = {};
+			raw.tools = created;
+			return created;
+		};
+		const toolsObj = raw.tools as Record<string, unknown> | undefined;
+		if (toolsObj && "essentialOverride" in toolsObj) {
+			toolsObj.essentialOverride = migrateToolNameList(toolsObj.essentialOverride);
+		}
+		if ("tools.essentialOverride" in raw) {
+			const nestedToolsObj = ensureToolsObject();
+			if (!("essentialOverride" in nestedToolsObj)) {
+				nestedToolsObj.essentialOverride = migrateToolNameList(raw["tools.essentialOverride"]);
+			}
+			delete raw["tools.essentialOverride"];
+		}
+
+		// Also clean up any empty nested objects we might have created or left behind
+		if (raw.glob && typeof raw.glob === "object" && Object.keys(raw.glob).length === 0) {
+			delete raw.glob;
+		}
+		if (raw.grep && typeof raw.grep === "object" && Object.keys(raw.grep).length === 0) {
+			delete raw.grep;
+		}
 		// readHashLines: removed. Hashline anchors are now driven solely by
 		// edit.mode === "hashline"; the separate read toggle only ever produced
 		// the incoherent "hashline edits without addressable anchors" state.
 		delete raw.readHashLines;
+
+		// serviceTier (single enum with scoped openai-only/claude-only sentinels)
+		// → per-family tier.openai/tier.anthropic/tier.google; serviceTierSubagent
+		// → tier.subagent; serviceTierAdvisor → tier.advisor. `fastModeScope` is
+		// dropped — per-family scoping is now expressed by the three tier settings.
+		const tierObj = isRecord(raw.tier) ? raw.tier : {};
+		let tierTouched = false;
+		const setTier = (family: string, value: unknown): void => {
+			if (value !== undefined && !(family in tierObj)) {
+				tierObj[family] = value;
+				tierTouched = true;
+			}
+		};
+		if (typeof raw.serviceTier === "string") {
+			switch (raw.serviceTier) {
+				case "priority":
+					setTier("openai", "priority");
+					setTier("anthropic", "priority");
+					setTier("google", "priority");
+					break;
+				case "openai-only":
+					setTier("openai", "priority");
+					break;
+				case "claude-only":
+					setTier("anthropic", "priority");
+					break;
+				case "auto":
+				case "default":
+				case "flex":
+				case "scale":
+					setTier("openai", raw.serviceTier);
+					break;
+			}
+			delete raw.serviceTier;
+		}
+		const mapInheritTier = (value: unknown): unknown =>
+			value === "openai-only" || value === "claude-only" ? "priority" : value;
+		if ("serviceTierSubagent" in raw) {
+			setTier("subagent", mapInheritTier(raw.serviceTierSubagent));
+			delete raw.serviceTierSubagent;
+		}
+		if ("serviceTierAdvisor" in raw) {
+			setTier("advisor", mapInheritTier(raw.serviceTierAdvisor));
+			delete raw.serviceTierAdvisor;
+		}
+		if (tierTouched) raw.tier = tierObj;
+		delete raw.fastModeScope;
 
 		return raw;
 	}
@@ -1040,6 +1368,7 @@ export class Settings {
 		this.#merged = this.#deepMerge(this.#merged, this.#configOverlay);
 		this.#merged = this.#deepMerge(this.#merged, this.#overrides);
 		this.#resolvedCache.clear();
+		this.#editVariantCache = undefined;
 	}
 
 	#fireAllHooks(): void {
@@ -1152,9 +1481,23 @@ const SETTING_HOOKS: Partial<Record<SettingPath, SettingHook<any>>> = {
 			appendOnlyModeSignal.fire(value);
 		}
 	},
+	"providers.maxInFlightRequests": value => {
+		configureProviderMaxInFlightRequests(validateProviderMaxInFlightRequests(value));
+	},
 	"hindsight.bankId": () => hindsightScopeSignal.fire(),
 	"hindsight.bankIdPrefix": () => hindsightScopeSignal.fire(),
 	"hindsight.scoping": () => hindsightScopeSignal.fire(),
+	"worktree.base": value => {
+		const dir = typeof value === "string" && value.trim() ? value : undefined;
+		// Always call so an unset/empty value clears a previously-applied override.
+		// setWorktreesDir expands `~`, rejects relative paths, and returns the
+		// applied absolute path (or undefined when cleared/rejected).
+		if (dir && !setWorktreesDir(dir)) {
+			logger.warn("Settings: worktree.base must be an absolute or ~-relative path; ignoring", { value: dir });
+		} else if (!dir) {
+			setWorktreesDir(undefined);
+		}
+	},
 };
 /** Fires when `provider.appendOnlyContext` changes at runtime. */
 const appendOnlyModeSignal = new SettingSignal<[value: string]>("provider.appendOnlyContext");
@@ -1165,6 +1508,12 @@ const appendOnlyModeSignal = new SettingSignal<[value: string]>("provider.append
  * can register independently without overwriting each other.
  */
 export const onAppendOnlyModeChanged = (cb: (value: string) => void) => appendOnlyModeSignal.on(cb);
+
+/** Fires when any model role changes at runtime. */
+const modelRolesSignal = new SettingSignal("modelRoles");
+
+/** Subscribe to model role changes. Returns an unsubscribe function. */
+export const onModelRolesChanged: (cb: () => void) => () => void = modelRolesSignal.on.bind(modelRolesSignal);
 
 /** Fires when `statusLine.sessionAccent` changes at runtime. */
 const statusLineSessionAccentSignal = new SettingSignal("statusLine.sessionAccent");
@@ -1216,6 +1565,7 @@ export function resetSettingsForTest(): void {
 	globalInstance = null;
 	globalInstancePromise = null;
 	clearBoundSettingsMethods();
+	configureProviderMaxInFlightRequests(undefined);
 }
 
 /**

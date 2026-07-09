@@ -10,12 +10,14 @@ import tinyTitleSystemPrompt from "../prompts/system/tiny-title-system.md" with 
 import {
 	errorMessage,
 	errorText,
+	formatOnnxRuntimeCudaDiagnostics,
 	getTransformersVersionSpec,
 	loadTransformersRuntime,
 	MemoizedRuntime,
 	replayCachedReady,
 	sendLog,
 	sendProgress,
+	type TransformersRuntimeMetadata,
 } from "../subprocess/worker-runtime";
 import { resolveTinyModelDevicePreference, type TinyModelDevice, tinyModelDeviceLoadOrder } from "./device";
 import { resolveTinyModelDtypeOverride, type TinyModelDtype } from "./dtype";
@@ -39,7 +41,7 @@ const TINY_TITLE_SYSTEM_PROMPT = prompt.render(tinyTitleSystemPrompt);
 const tinyModelDevicePreference = resolveTinyModelDevicePreference();
 const tinyModelDtypeOverride = resolveTinyModelDtypeOverride();
 
-interface TransformersRuntime {
+interface TransformersRuntime extends TransformersRuntimeMetadata {
 	env: {
 		cacheDir?: string;
 		allowLocalModels?: boolean;
@@ -136,6 +138,7 @@ async function loadPipelineWithDeviceFallback(
 			device: devices[0],
 		});
 	}
+	let cudaDiagnostics: string | null = null;
 	for (let i = 0; i < devices.length; i += 1) {
 		const device = devices[i]!;
 		try {
@@ -144,15 +147,22 @@ async function loadPipelineWithDeviceFallback(
 				device,
 			};
 		} catch (error) {
-			if (i === devices.length - 1) throw error;
+			const deviceDiagnostics = await formatOnnxRuntimeCudaDiagnostics(transformers, device, error);
+			if (deviceDiagnostics) cudaDiagnostics = deviceDiagnostics;
+			if (i === devices.length - 1) {
+				if (cudaDiagnostics) throw new Error(`${errorText(error)}\n${cudaDiagnostics}`);
+				throw error;
+			}
 			const fallbackDevice = devices[i + 1]!;
-			sendLog(transport, "warn", "tiny-model: accelerated device failed; falling back", {
+			const meta: Record<string, unknown> = {
 				modelKey,
 				repo: spec.repo,
 				device,
 				fallbackDevice,
 				error: errorMessage(error),
-			});
+			};
+			if (deviceDiagnostics) meta.cudaDiagnostics = deviceDiagnostics;
+			sendLog(transport, "warn", "tiny-model: accelerated device failed; falling back", meta);
 		}
 	}
 	throw new Error("No tiny model devices configured");
@@ -217,14 +227,14 @@ function buildPrompt(generator: TextGenerationPipeline, message: string, systemP
 	return `${generator.tokenizer.apply_chat_template(chat, chatTemplateOptions)}${TITLE_PREFILL}`;
 }
 
-function extractTinyTitle(text: string): string | null {
+function extractTinyTitle(text: string, sourceText: string): string | null {
 	const titleStart = text.lastIndexOf(TITLE_PREFILL);
 	const withoutPrefix = titleStart >= 0 ? text.slice(titleStart + TITLE_PREFILL.length) : text;
 	const closeIndex = withoutPrefix.indexOf(TITLE_CLOSE);
 	const withoutClose = closeIndex >= 0 ? withoutPrefix.slice(0, closeIndex) : withoutPrefix;
 	const tagIndex = withoutClose.indexOf("<");
 	const withoutTag = tagIndex >= 0 ? withoutClose.slice(0, tagIndex) : withoutClose;
-	return normalizeGeneratedTitle(withoutTag);
+	return normalizeGeneratedTitle(withoutTag, sourceText);
 }
 
 async function generateTitle(
@@ -249,7 +259,7 @@ async function generateTitle(
 		return_full_text: false,
 		stopping_criteria: createStopOnTextCriteria(transformers, generator.tokenizer, TITLE_CLOSE),
 	})) as TextGenerationStringOutput;
-	return extractTinyTitle(output[0]?.generated_text ?? "");
+	return extractTinyTitle(output[0]?.generated_text ?? "", message);
 }
 
 function buildCompletionPrompt(generator: TextGenerationPipeline, promptText: string): string {

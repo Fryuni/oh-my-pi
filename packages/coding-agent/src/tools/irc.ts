@@ -19,7 +19,7 @@ import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { IrcBus, type IrcDeliveryReceipt, type IrcMessage } from "../irc/bus";
 import type { Theme } from "../modes/theme/theme";
 import ircDescription from "../prompts/tools/irc.md" with { type: "text" };
-import type { AgentRegistry } from "../registry/agent-registry";
+import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { canSpawnAtDepth } from "../task/types";
 import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from ".";
@@ -97,6 +97,7 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 	readonly description: string;
 	readonly parameters = ircSchema;
 	readonly strict = true;
+	readonly interruptible = true;
 
 	readonly examples: readonly ToolExample<typeof ircSchema.infer>[] = [
 		{
@@ -170,9 +171,9 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 			case "send":
 				return this.#executeSend(registry, senderId, params, signal);
 			case "wait":
-				return this.#executeWait(senderId, params, signal);
+				return this.#executeWait(registry, senderId, params, signal);
 			case "inbox":
-				return this.#executeInbox(senderId, params);
+				return this.#executeInbox(registry, senderId, params);
 			default:
 				return errorResult("Unknown irc op.", { op: params.op });
 		}
@@ -280,6 +281,10 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 			// parked agent on a broadcast would be a stampede. Direct sends go
 			// through the bus unfiltered so parked recipients are revived.
 			const targets = isBroadcast ? registry.listVisibleTo(senderId).map(ref => ref.id) : [to];
+			// A broadcast that also reaches the main agent delivers the body to it
+			// directly (its own incoming card); relaying the sibling legs to the
+			// main UI would then show the same body once per other recipient.
+			const suppressRelay = isBroadcast && targets.includes(MAIN_AGENT_ID);
 			const receipts = await Promise.all(
 				targets.map(target =>
 					bus.send(
@@ -287,7 +292,7 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 						// Awaited sends mark the sender as blocked on an answer so a
 						// busy recipient that cannot reach a step boundary (async
 						// disabled) auto-replies instead of stranding the sender.
-						params.await ? { expectsReply: true } : undefined,
+						{ expectsReply: params.await || undefined, suppressRelay: suppressRelay || undefined },
 					),
 				),
 			);
@@ -313,16 +318,30 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 				lines.push("");
 				if (delivered.length > 0) {
 					const reply = await waiting;
-					if (reply.error) throw reply.error;
-					waited = reply.message;
-					if (waited) {
-						lines.push(`Reply from ${waited.from}:`);
-						lines.push(waited.body);
+					if (reply.error) {
+						// The send already succeeded; if the wait was interrupted by our
+						// caller signal (steering / IRC), preserve the delivery receipt so
+						// the agent loop keeps this tool as "sent" instead of marking it
+						// skipped, which would prompt a duplicate resend on the next turn.
+						if (signal?.aborted) {
+							lines.push(
+								`Send delivered but the reply wait was interrupted before ${to} answered. ` +
+									"Check `inbox` or `wait` again after handling the interrupt.",
+							);
+						} else {
+							throw reply.error;
+						}
 					} else {
-						lines.push(
-							`No reply from ${to} within ${formatDuration(timeoutMs)}. ` +
-								"They may answer later — check `inbox` or `wait` again.",
-						);
+						waited = reply.message;
+						if (waited) {
+							lines.push(`Reply from ${waited.from}:`);
+							lines.push(waited.body);
+						} else {
+							lines.push(
+								`No reply from ${to} within ${formatDuration(timeoutMs)}. ` +
+									"They may answer later — check `inbox` or `wait` again.",
+							);
+						}
 					}
 				} else {
 					awaitAbort?.abort(awaitCancelled);
@@ -348,8 +367,24 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 		}
 	}
 
-	async #executeWait(senderId: string, params: IrcParams, signal?: AbortSignal): Promise<AgentToolResult<IrcDetails>> {
+	async #executeWait(
+		registry: AgentRegistry,
+		senderId: string,
+		params: IrcParams,
+		signal?: AbortSignal,
+	): Promise<AgentToolResult<IrcDetails>> {
 		const from = params.from?.trim() || undefined;
+		const session = registry.get(senderId)?.session;
+		const pending =
+			typeof session?.drainPendingIrcInboxMessages === "function"
+				? session.drainPendingIrcInboxMessages(senderId, { from, limit: 1 })[0]
+				: undefined;
+		if (pending) {
+			return {
+				content: [{ type: "text", text: formatIncoming(pending) }],
+				details: { op: "wait", from: senderId, waited: pending },
+			};
+		}
 		const timeoutMs = this.#resolveTimeoutMs(params);
 		const waited = await IrcBus.global().wait(senderId, { from }, timeoutMs, signal);
 		if (!waited) {
@@ -367,8 +402,14 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 		};
 	}
 
-	#executeInbox(senderId: string, params: IrcParams): AgentToolResult<IrcDetails> {
-		const messages = IrcBus.global().inbox(senderId, { peek: params.peek });
+	#executeInbox(registry: AgentRegistry, senderId: string, params: IrcParams): AgentToolResult<IrcDetails> {
+		const busMessages = IrcBus.global().inbox(senderId, { peek: params.peek });
+		const session = registry.get(senderId)?.session;
+		const pendingMessages =
+			typeof session?.drainPendingIrcInboxMessages === "function"
+				? session.drainPendingIrcInboxMessages(senderId)
+				: [];
+		const messages = [...busMessages, ...pendingMessages].sort((a, b) => a.ts - b.ts);
 		if (messages.length === 0) {
 			return {
 				content: [{ type: "text", text: "Inbox empty." }],

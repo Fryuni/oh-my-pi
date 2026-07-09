@@ -326,7 +326,26 @@ function formatAccountHeader(
 	const planType = report.metadata?.planType;
 	if (typeof planType === "string" && planType) header += chalk.dim(` · plan: ${planType}`);
 	const savedResets = report.resetCredits?.availableCount ?? 0;
-	if (savedResets > 0) header += chalk.cyan(` · ✦ ${savedResets} saved reset${savedResets === 1 ? "" : "s"}`);
+	if (savedResets > 0) {
+		header += chalk.cyan(` · ✦ ${savedResets} saved reset${savedResets === 1 ? "" : "s"}`);
+		const credits = report.resetCredits?.credits;
+		if (credits) {
+			const expiries = credits
+				.filter(c => c.expiresAt)
+				.map(c => ({ date: c.expiresAt!, ms: Date.parse(c.expiresAt!) }))
+				.filter(c => !Number.isNaN(c.ms))
+				.sort((a, b) => a.ms - b.ms);
+			const upcoming = expiries.find(c => c.ms > nowMs);
+			if (upcoming) {
+				header += chalk.dim(
+					` · soonest expires in ${formatDuration(upcoming.ms - nowMs)} (${upcoming.date.slice(0, 10)})`,
+				);
+			} else {
+				const lastExpired = expiries.at(-1);
+				if (lastExpired) header += chalk.dim(` · expired (${lastExpired.date.slice(0, 10)})`);
+			}
+		}
+	}
 	if (report.fetchedAt && nowMs - report.fetchedAt > 90_000) {
 		header += chalk.dim(` · fetched ${formatDuration(nowMs - report.fetchedAt)} ago`);
 	}
@@ -349,6 +368,29 @@ function formatLimitLine(limit: UsageLimit, labelWidth: number, nowMs: number): 
 		lines.push(`        ${chalk.dim(limit.notes.join(" · "))}`);
 	}
 	return lines;
+}
+
+interface ProviderLimitTemplate {
+	id: string;
+	title: string;
+}
+
+function collectProviderLimitTemplates(reports: UsageReport[]): ProviderLimitTemplate[] {
+	const seen = new Set<string>();
+	const templates: ProviderLimitTemplate[] = [];
+	for (const report of reports) {
+		for (const limit of report.limits) {
+			if (seen.has(limit.id)) continue;
+			seen.add(limit.id);
+			templates.push({ id: limit.id, title: limitTitle(limit) });
+		}
+	}
+	return templates;
+}
+
+function formatMissingLimitLine(template: ProviderLimitTemplate, labelWidth: number): string {
+	const padded = template.title.padEnd(labelWidth);
+	return `      ${chalk.dim("○")} ${padded}  ${chalk.dim("·".repeat(BAR_WIDTH))}  ${chalk.dim("not reported")}`;
 }
 
 /** Per-window capacity stat: how much account quota is burned and left. */
@@ -455,9 +497,8 @@ export function formatUsageBreakdown(
 		for (const note of providerNotes)
 			lines.push(`  ${chalk.dim(sanitizeText(note.replace(/[\r\n]+/g, " ").replace(/\t/g, "  ")))}`);
 
-		const labelWidth = providerReports
-			.flatMap(report => report.limits)
-			.reduce((max, limit) => Math.max(max, limitTitle(limit).length), 0);
+		const providerLimitTemplates = collectProviderLimitTemplates(providerReports);
+		const labelWidth = providerLimitTemplates.reduce((max, template) => Math.max(max, template.title.length), 0);
 
 		providerReports.forEach((report, index) => {
 			lines.push(`  ${formatAccountHeader(report, index, nowMs, redaction)}`);
@@ -465,8 +506,15 @@ export function formatUsageBreakdown(
 				lines.push(`      ${chalk.dim("no limits reported")}`);
 				return;
 			}
-			for (const limit of report.limits) {
-				lines.push(...formatLimitLine(limit, labelWidth, nowMs));
+			const limitsById = new Map<string, UsageLimit>();
+			for (const limit of report.limits) limitsById.set(limit.id, limit);
+			for (const template of providerLimitTemplates) {
+				const limit = limitsById.get(template.id);
+				if (limit) {
+					lines.push(...formatLimitLine(limit, labelWidth, nowMs));
+				} else {
+					lines.push(formatMissingLimitLine(template, labelWidth));
+				}
 			}
 		});
 

@@ -1,4 +1,5 @@
 import { $env } from "@oh-my-pi/pi-utils";
+import * as AIError from "../error";
 
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS = 100_000;
@@ -135,6 +136,16 @@ export interface IdleTimeoutIteratorOptions {
 	 */
 	isProgressItem?: (item: unknown) => boolean;
 	/**
+	 * Reports consumer-side local work in flight for the stream: the provider
+	 * transport is waiting on a server-requested local tool bridge (e.g. the
+	 * Cursor exec channel) before anything can flow upstream again. While it
+	 * returns true, an expired idle / first-item deadline slides forward
+	 * instead of aborting — the silence is ours, not a provider stall. The
+	 * watchdog re-arms with a full budget once the local work completes, so a
+	 * provider that stalls afterwards is still caught.
+	 */
+	hasPendingLocalWork?: () => boolean;
+	/**
 	 * Cancel iteration as soon as this signal aborts. Required for caller-driven
 	 * cancellation (ESC) when the underlying transport does not surface signal
 	 * aborts to the iterator (HTTP/2 proxies, native sockets, mocked fetch).
@@ -156,7 +167,7 @@ export async function* iterateWithIdleTimeout<T>(
 	options: IdleTimeoutIteratorOptions,
 ): AsyncGenerator<T> {
 	const firstItemTimeoutMs = options.firstItemTimeoutMs ?? options.idleTimeoutMs;
-	const firstItemDeadlineMs =
+	let firstItemDeadlineMs =
 		firstItemTimeoutMs !== undefined && firstItemTimeoutMs > 0 ? Date.now() + firstItemTimeoutMs : undefined;
 	const abortSignal = options.abortSignal;
 	const iterator = iterable[Symbol.asyncIterator]();
@@ -195,6 +206,28 @@ export async function* iterateWithIdleTimeout<T>(
 		}
 	};
 	let lastProgressAt = Date.now();
+
+	const hasPendingLocalWork = (): boolean => {
+		if (!options.hasPendingLocalWork) return false;
+		try {
+			return options.hasPendingLocalWork();
+		} catch {
+			return false;
+		}
+	};
+	// Local work means the current gap is attributable to the consumer side,
+	// not the provider: slide the active deadline a full budget past now
+	// instead of aborting. Once the work completes the watchdog resumes from
+	// the last extension, so a provider that stalls afterwards is still caught.
+	const extendDeadlineForLocalWork = (): void => {
+		if (awaitingFirstItem) {
+			if (firstItemDeadlineMs !== undefined && firstItemTimeoutMs !== undefined) {
+				firstItemDeadlineMs = Date.now() + firstItemTimeoutMs;
+			}
+		} else {
+			lastProgressAt = Date.now();
+		}
+	};
 
 	const noTimeoutEnforced =
 		(firstItemTimeoutMs === undefined || firstItemTimeoutMs <= 0) &&
@@ -270,6 +303,12 @@ export async function* iterateWithIdleTimeout<T>(
 		timer = setTimeout(onTimerFire, Math.max(0, deadlineMs - Date.now()));
 	};
 
+	// The in-flight iterator.next() promise, persisted across loop iterations:
+	// a deadline extension for pending local work loops without consuming it,
+	// and issuing a second next() while one is outstanding would drop an item.
+	let pendingNext:
+		| Promise<{ kind: "next"; result: IteratorResult<T> } | { kind: "error"; error: unknown }>
+		| undefined;
 	try {
 		let raceCount = 0;
 		while (true) {
@@ -290,21 +329,29 @@ export async function* iterateWithIdleTimeout<T>(
 				if (firstItemDeadlineMs !== undefined) {
 					activeTimeoutMs = firstItemDeadlineMs - Date.now();
 					if (activeTimeoutMs <= 0) {
-						options.onFirstItemTimeout?.();
-						closeIterator();
-						throw new Error(options.firstItemErrorMessage ?? options.errorMessage);
+						if (!hasPendingLocalWork()) {
+							options.onFirstItemTimeout?.();
+							closeIterator();
+							throw new AIError.StreamTimeoutError(options.firstItemErrorMessage ?? options.errorMessage);
+						}
+						extendDeadlineForLocalWork();
+						activeTimeoutMs = firstItemDeadlineMs! - Date.now();
 					}
 				}
 			} else if (options.idleTimeoutMs !== undefined && options.idleTimeoutMs > 0) {
 				activeTimeoutMs = options.idleTimeoutMs - (Date.now() - lastProgressAt);
 				if (activeTimeoutMs <= 0) {
-					options.onIdle?.();
-					closeIterator();
-					throw new Error(options.errorMessage);
+					if (!hasPendingLocalWork()) {
+						options.onIdle?.();
+						closeIterator();
+						throw new AIError.StreamTimeoutError(options.errorMessage);
+					}
+					extendDeadlineForLocalWork();
+					activeTimeoutMs = options.idleTimeoutMs;
 				}
 			}
 
-			const nextResultPromise = withRacy(iterator.next());
+			pendingNext ??= withRacy(iterator.next());
 
 			const racers: Array<
 				Promise<
@@ -313,7 +360,7 @@ export async function* iterateWithIdleTimeout<T>(
 					| { kind: "timeout" }
 					| { kind: "abort" }
 				>
-			> = [nextResultPromise];
+			> = [pendingNext];
 
 			const enforceTimeout = !noTimeoutEnforced && activeTimeoutMs !== undefined && activeTimeoutMs > 0;
 			if (enforceTimeout) {
@@ -332,18 +379,28 @@ export async function* iterateWithIdleTimeout<T>(
 			let continuing = false;
 			try {
 				const outcome = await Promise.race(racers);
+				if (outcome.kind === "next" || outcome.kind === "error") {
+					pendingNext = undefined;
+				}
 				if (outcome.kind === "abort") {
 					closeIterator();
 					throw abortReason(abortSignal!);
 				}
 				if (outcome.kind === "timeout") {
+					if (hasPendingLocalWork()) {
+						// A local tool is still running; the provider cannot make
+						// progress until we hand its result back. Keep waiting.
+						extendDeadlineForLocalWork();
+						continuing = true;
+						continue;
+					}
 					if (!awaitingFirstItem) {
 						options.onIdle?.();
 					} else {
 						options.onFirstItemTimeout?.();
 					}
 					closeIterator();
-					throw new Error(
+					throw new AIError.StreamTimeoutError(
 						!awaitingFirstItem ? options.errorMessage : (options.firstItemErrorMessage ?? options.errorMessage),
 					);
 				}
@@ -467,6 +524,6 @@ export async function* iterateWithTerminalGrace<T>(
 function abortReason(signal: AbortSignal): Error {
 	const reason = signal.reason;
 	if (reason instanceof Error) return reason;
-	if (typeof reason === "string") return new Error(reason);
-	return new Error("Request was aborted");
+	if (typeof reason === "string") return new AIError.AbortError(reason);
+	return new AIError.AbortError();
 }

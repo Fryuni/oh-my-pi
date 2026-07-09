@@ -10,6 +10,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { buildSystemPrompt } from "@oh-my-pi/pi-coding-agent/system-prompt";
+import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 const EMPTY_TREE = {
@@ -19,6 +20,69 @@ const EMPTY_TREE = {
 	totalLines: 0,
 	agentsMdFiles: [],
 };
+
+async function expectPromptDateFromStartupTimezone(options: {
+	tempDir: string;
+	tempHomeDir: string;
+	timeZone: string;
+	now: string;
+	expectedDate: string;
+	rejectedDate: string;
+}): Promise<void> {
+	const scenarioPath = path.join(options.tempDir, "prompt-date-timezone.test.ts");
+	await Bun.write(
+		scenarioPath,
+		`import { expect, it, setSystemTime } from "bun:test";
+import { buildSystemPrompt } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/system-prompt.ts"))};
+
+it("renders the prompt date in the startup timezone", async () => {
+	setSystemTime(new Date(process.env.OMP_TEST_NOW!));
+	try {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: process.cwd(),
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			toolNames: [],
+			workspaceTree: {
+				rootPath: process.cwd(),
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+			activeRepoContext: null,
+		});
+		const rendered = systemPrompt.join("\\n\\n");
+		expect(rendered).toContain(\`Today is \${process.env.OMP_EXPECTED_DATE}\`);
+		expect(rendered).not.toContain(\`Today is \${process.env.OMP_REJECTED_DATE}\`);
+	} finally {
+		setSystemTime();
+	}
+});
+`,
+	);
+	const child = Bun.spawn([process.execPath, "test", scenarioPath], {
+		cwd: options.tempDir,
+		env: {
+			...process.env,
+			HOME: options.tempHomeDir,
+			TZ: options.timeZone,
+			OMP_TEST_NOW: options.now,
+			OMP_EXPECTED_DATE: options.expectedDate,
+			OMP_REJECTED_DATE: options.rejectedDate,
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout).text(),
+		new Response(child.stderr).text(),
+		child.exited,
+	]);
+	expect(`${stdout}\n${stderr}`).toContain("1 pass");
+	expect(exitCode).toBe(0);
+}
 
 describe("system prompt model identifier", () => {
 	let tempDir = "";
@@ -46,6 +110,17 @@ describe("system prompt model identifier", () => {
 		});
 
 		expect(systemPrompt.join("\n\n")).toContain("Model: anthropic/claude-opus-4");
+	});
+
+	it("renders the prompt date from the startup local timezone rather than UTC", async () => {
+		await expectPromptDateFromStartupTimezone({
+			tempDir,
+			tempHomeDir,
+			timeZone: "America/Los_Angeles",
+			now: "2026-07-01T03:15:00Z",
+			expectedDate: "2026-06-30",
+			rejectedDate: "2026-07-01",
+		});
 	});
 
 	it("omits the model line when no model is provided", async () => {
@@ -80,7 +155,7 @@ describe("AgentSession model-change prompt refresh", () => {
 			session = undefined;
 		}
 		authStorage.close();
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		removeSyncWithRetries(tempDir);
 	});
 
 	function pickTwoModels(): [Model, Model] {

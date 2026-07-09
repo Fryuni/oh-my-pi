@@ -10,6 +10,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { parseModelPattern } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -218,6 +219,59 @@ describe("AgentSession retry fallback", () => {
 		]);
 	});
 
+	it("uses the active initial model as the default fallback primary when other role fallback chains are configured", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		const otherRoleFallbackModel = getBundledModel("openai", "gpt-4o");
+		if (!primaryModel || !fallbackModel || !otherRoleFallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const agent = createFallbackAgent(primaryModel, requestedModels);
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.maxRetries": 1,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+				smol: [`${otherRoleFallbackModel.provider}/${otherRoleFallbackModel.id}`],
+			},
+		});
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") {
+				fallbackAppliedEvents.push(event);
+			}
+		});
+
+		await session.prompt("Recover using implicit default primary");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(session.model?.provider).toBe(fallbackModel.provider);
+		expect(session.model?.id).toBe(fallbackModel.id);
+		expect(fallbackAppliedEvents).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: `${primaryModel.provider}/${primaryModel.id}`,
+				to: `${fallbackModel.provider}/${fallbackModel.id}`,
+				role: "default",
+			},
+		]);
+	});
+
 	it("falls back on structured classifier refusals and pins the fallback", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
@@ -326,6 +380,103 @@ describe("AgentSession retry fallback", () => {
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 			`${fallbackModel.provider}/${fallbackModel.id}`,
 		]);
+	});
+
+	it("drops classifier refusal messages before later prompts", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primaryModel) {
+			throw new Error("Expected bundled test model to exist");
+		}
+
+		const mock = createMockModel({
+			responses: [
+				{
+					content: ["Classifier declined this turn."],
+					stopReason: "error",
+					stopDetails: {
+						type: "refusal",
+						category: "bio",
+						explanation: "Classifier declined this turn.",
+					},
+					errorMessage: "Refusal (bio): Classifier declined this turn.",
+				},
+				context => {
+					const replayedAssistantText = context.messages
+						.filter((message): message is AssistantMessage => message.role === "assistant")
+						.flatMap(message => message.content)
+						.filter(block => block.type === "text")
+						.map(block => block.text)
+						.join("\n");
+					return {
+						content: [replayedAssistantText.includes("Classifier declined this turn.") ? "polluted" : "clean"],
+					};
+				},
+			],
+		});
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (model, context, options) => mock.stream(model, context, options),
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 1,
+			"retry.modelFallback": false,
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		const sessionStopCalls: number[] = [];
+		const sessionStopLastAssistantMessages: Array<AssistantMessage | undefined> = [];
+		const extensionRunner = {
+			emit: vi.fn().mockResolvedValue(undefined),
+			emitBeforeAgentStart: vi.fn().mockResolvedValue(undefined),
+			hasHandlers: vi.fn((eventType: string) => eventType === "session_stop"),
+			emitSessionStop: vi.fn((event: { last_assistant_message?: AssistantMessage }) => {
+				sessionStopCalls.push(mock.calls.length);
+				sessionStopLastAssistantMessages.push(event.last_assistant_message);
+				return Promise.resolve(undefined);
+			}),
+		} as unknown as ExtensionRunner;
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			extensionRunner,
+		});
+
+		await session.prompt("Trigger classifier refusal");
+		await session.waitForIdle();
+		await session.prompt("Next prompt should not replay the refusal");
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		const replayedAssistantText = mock.calls[1]?.context.messages
+			.filter((message): message is AssistantMessage => message.role === "assistant")
+			.flatMap(message => message.content)
+			.filter(block => block.type === "text")
+			.map(block => block.text)
+			.join("\n");
+		expect(replayedAssistantText).not.toContain("Classifier declined this turn.");
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "clean" }]);
+		// session_stop hooks must fire after each settled turn — including the
+		// refusal turn (regression: prior to PR #3594's review fix, the refusal
+		// branch short-circuited before `#emitSessionStopEvent`).
+		expect(sessionStopCalls).toEqual([1, 2]);
+		expect(sessionStopLastAssistantMessages[0]?.stopReason).toBe("error");
+		expect(sessionStopLastAssistantMessages[0]?.stopDetails).toEqual({
+			type: "refusal",
+			category: "bio",
+			explanation: "Classifier declined this turn.",
+		});
 	});
 
 	it("does not exceed retry.maxRetries for classifier fallback chains", async () => {

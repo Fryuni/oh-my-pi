@@ -97,10 +97,14 @@ describe("AgentSession auto-compaction queue resume", () => {
 			modelRegistry,
 		);
 
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) {
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundled) {
 			throw new Error("Expected built-in anthropic model to exist");
 		}
+		// Pin the window and output reservation: the threshold/usage math below is
+		// tuned to a 200k/64k context-full budget and must stay stable across
+		// catalog regenerations.
+		const model = { ...bundled, contextWindow: 200_000, maxTokens: 64_000 };
 
 		const agent = new Agent({
 			initialState: {
@@ -503,7 +507,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const bigCallId = "call-big-useless";
 		sessionManager.appendMessage({
 			role: "assistant",
-			content: [{ type: "toolCall", id: bigCallId, name: "search", arguments: { pattern: "TODO" } }],
+			content: [{ type: "toolCall", id: bigCallId, name: "grep", arguments: { pattern: "TODO" } }],
 			api: "anthropic-messages",
 			provider: "anthropic",
 			model: "claude-sonnet-4-5",
@@ -521,7 +525,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		sessionManager.appendMessage({
 			role: "toolResult",
 			toolCallId: bigCallId,
-			toolName: "search",
+			toolName: "grep",
 			content: [{ type: "text", text: "match line\n".repeat(20000) }], // ~40k+ tokens
 			isError: false,
 			useless: true,

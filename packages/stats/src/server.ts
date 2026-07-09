@@ -13,11 +13,13 @@ import {
 	getRecentErrors,
 	getRecentRequests,
 	getRequestDetails,
+	getToolDashboardStats,
 	getTotalMessageCount,
 	syncAllSessions,
 } from "./aggregator";
 import { decodeEmbeddedClientArchive } from "./embedded-client";
 import embeddedClientArchiveTxt from "./embedded-client.generated.txt";
+import { getGainDashboardStats } from "./gain-aggregator";
 
 const EMBEDDED_CLIENT_ARCHIVE = decodeEmbeddedClientArchive(embeddedClientArchiveTxt);
 
@@ -214,6 +216,11 @@ async function handleApi(req: Request): Promise<Response> {
 		return Response.json(stats);
 	}
 
+	if (path === "/api/stats/tools") {
+		const stats = await getToolDashboardStats(range);
+		return Response.json(stats);
+	}
+
 	if (path === "/api/stats/recent") {
 		const limit = url.searchParams.get("limit");
 		const stats = await getRecentRequests(limit ? parseInt(limit, 10) : undefined);
@@ -253,6 +260,12 @@ async function handleApi(req: Request): Promise<Response> {
 		const result = await syncAllSessions();
 		const count = await getTotalMessageCount();
 		return Response.json({ ...result, totalMessages: count });
+	}
+
+	if (path === "/api/stats/gain") {
+		const project = url.searchParams.get("project");
+		const stats = await getGainDashboardStats(range, project);
+		return Response.json(stats);
 	}
 
 	return new Response("Not Found", { status: 404 });

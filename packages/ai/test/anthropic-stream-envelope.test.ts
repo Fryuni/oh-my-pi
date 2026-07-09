@@ -139,6 +139,14 @@ function createStrictGrammarTooLargeError(): Error {
 	return error;
 }
 
+// Azure Foundry-style rejection: no invalid_request_error wrapper, the gateway
+// just names the missing feature for the hosted model deployment.
+function createStructuredOutputsUnsupportedError(): Error {
+	const error = new Error('400 {"error":{"code":"BadRequest","message":"structured_outputs not supported"}}');
+	(error as Error & { status: number }).status = 400;
+	return error;
+}
+
 function createOtherInvalidRequestError(): Error {
 	const error = new Error(
 		'400 {"type":"error","error":{"type":"invalid_request_error","message":"Some other validation error."},"request_id":"req_test"}',
@@ -352,7 +360,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("msg_text_success");
-		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hello" }]);
 	});
 
 	it("decodes escaped Anthropic built-in tool names from compatible gateways", async () => {
@@ -405,7 +413,7 @@ describe("anthropic stream envelope handling", () => {
 
 		expect(countEvents(events, "toolcall_start")).toBe(1);
 		expect(result.stopReason).toBe("toolUse");
-		expect(result.content).toEqual([
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([
 			{
 				type: "toolCall",
 				id: "tool_1",
@@ -465,7 +473,7 @@ describe("anthropic stream envelope handling", () => {
 
 		expect(countEvents(events, "toolcall_start")).toBe(1);
 		expect(result.stopReason).toBe("toolUse");
-		expect(result.content).toEqual([
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([
 			{
 				type: "toolCall",
 				id: "tool_1",
@@ -532,7 +540,7 @@ describe("anthropic stream envelope handling", () => {
 
 		expect(countEvents(events, "toolcall_start")).toBe(0);
 		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "59" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "59" }]);
 	});
 
 	it("passes Umans gateway web search headers to custom clients", async () => {
@@ -572,7 +580,7 @@ describe("anthropic stream envelope handling", () => {
 		}
 		const result = await stream.result();
 
-		expect(result.content).toEqual([{ type: "text", text: "59" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "59" }]);
 		expect(capturedParams?.tools?.map(tool => tool.name)).toEqual(["web_search"]);
 		expect(capturedOptions?.headers).toEqual({ "X-Umans-Websearch-Provider": "exa" });
 	});
@@ -602,7 +610,7 @@ describe("anthropic stream envelope handling", () => {
 		}
 		const result = await stream.result();
 
-		expect(result.content).toEqual([{ type: "text", text: "done" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "done" }]);
 		expect(capturedParams?.thinking?.type).toBe("enabled");
 		expect(capturedParams?.context_management).toBeUndefined();
 	});
@@ -641,10 +649,15 @@ describe("anthropic stream envelope handling", () => {
 			model,
 			false,
 		);
+		// The unwrapped thinking block carries no signature. On same-model replay to
+		// signature-enforcing Anthropic an unsigned thinking block is dropped entirely — it cannot
+		// replay natively (a "" signature 400s) and must not be demoted to text (demotion trips the
+		// reasoning_extraction classifier). It was this turn's only content, so the whole assistant
+		// message falls away, leaving just the two surrounding user turns with no leaked reasoning.
 		const replayAssistant = replayParams.find(param => param.role === "assistant");
-		expect(replayAssistant?.content).toEqual([
-			{ type: "text", text: "Check logs before accepting container health." },
-		]);
+		expect(replayAssistant).toBeUndefined();
+		expect(replayParams.map(param => param.role)).toEqual(["user", "user"]);
+		expect(replayParams.every(param => !JSON.stringify(param.content).includes("Check logs"))).toBe(true);
 	});
 	it("preserves signed thinking bytes when no literal thinking envelope is present", async () => {
 		const signedThinking = "\nCheck logs before accepting container health.\n";
@@ -719,7 +732,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(collected, "error")).toBe(0);
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("msg_first");
-		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hello" }]);
 	});
 
 	it("ignores ping before message_start and streams the response once", async () => {
@@ -744,7 +757,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("msg_text_success");
-		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hello" }]);
 	});
 
 	it("maps model_context_window_exceeded to a length stop", async () => {
@@ -765,7 +778,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "error")).toBe(0);
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("length");
-		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hello" }]);
 	});
 
 	it("completes the turn instead of failing when the API sends an unknown stop reason", async () => {
@@ -789,7 +802,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
 		expect(result.errorMessage).toBeUndefined();
-		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hello" }]);
 	});
 
 	it("ignores a spliced second envelope's message_delta after the terminal stop", async () => {
@@ -816,7 +829,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.usage.output).toBe(4);
 		expect(result.responseId).toBe("msg_text_success");
-		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hello" }]);
 	});
 
 	it("tolerates envelopes missing usage and delta payloads", async () => {
@@ -845,7 +858,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(collected, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("msg_lenient");
-		expect(result.content).toEqual([{ type: "text", text: "hi" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hi" }]);
 	});
 
 	it("ignores unknown preamble events before message_start and streams the response once", async () => {
@@ -872,7 +885,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("msg_text_success");
-		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hello" }]);
 	});
 
 	it("ignores unknown content block envelopes while preserving known blocks", async () => {
@@ -928,7 +941,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(observed, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("msg_unknown_block");
-		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hello" }]);
 	});
 
 	it("retries malformed envelopes before content starts without duplicating streamed text events", async () => {
@@ -954,7 +967,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "text_end")).toBe(1);
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "recovered" }]);
 	});
 
 	it("retries without strict tools after Anthropic compiled grammar errors and keeps strict disabled", async () => {
@@ -990,7 +1003,7 @@ describe("anthropic stream envelope handling", () => {
 
 		expect(result.stopReason).toBe("stop");
 		expect(result.errorMessage).toBeUndefined();
-		expect(result.content).toEqual([{ type: "text", text: "recovered" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "recovered" }]);
 		expect(countEvents(events, "done")).toBe(1);
 		expect(countEvents(events, "error")).toBe(0);
 		expect(strictFlags).toEqual([[true], [false]]);
@@ -1004,10 +1017,49 @@ describe("anthropic stream envelope handling", () => {
 		const nextResult = await nextStream.result();
 
 		expect(nextResult.stopReason).toBe("stop");
-		expect(nextResult.content).toEqual([{ type: "text", text: "later" }]);
+		expect(JSON.parse(JSON.stringify(nextResult.content))).toEqual([{ type: "text", text: "later" }]);
 		expect(countEvents(nextEvents, "done")).toBe(1);
 		expect(countEvents(nextEvents, "error")).toBe(0);
 		expect(strictFlags).toEqual([[true], [false], [false]]);
+	});
+
+	it("retries without strict tools when the endpoint rejects structured outputs for the model", async () => {
+		const toolContext: Context = {
+			...context,
+			tools: [
+				{
+					name: "edit",
+					description: "Edit a value",
+					strict: true,
+					parameters: queryObjectSchema,
+				},
+			],
+		};
+		const providerSessionState = new Map<string, ProviderSessionState>();
+		const strictFlags: boolean[][] = [];
+		let attempt = 0;
+		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
+			attempt += 1;
+			strictFlags.push(getStrictFlags(params));
+			if (attempt === 1) {
+				return createRejectedMockRequest(createStructuredOutputsUnsupportedError()) as never;
+			}
+			return createMockRequest(createTextSuccessEvents("recovered")) as never;
+		});
+
+		const stream = streamAnthropic(model, toolContext, { apiKey: "sk-ant-test", providerSessionState });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "recovered" }]);
+		expect(countEvents(events, "error")).toBe(0);
+		expect(strictFlags).toEqual([[true], [false]]);
+		expect(anthropicStrictToolsDisabled(providerSessionState)).toBe(true);
 	});
 
 	it("does not disable strict tools for unrelated Anthropic invalid request errors", async () => {
@@ -1076,7 +1128,7 @@ describe("anthropic stream envelope handling", () => {
 		}
 		// Best-effort arguments recovered by the throttled streaming parser are retained.
 		expect(toolCall.arguments).toEqual({ city: "Par" });
-		expect("partialJson" in toolCall).toBe(false);
+		expect((toolCall as unknown as Record<string, unknown>).partialJson).toBeUndefined();
 	});
 
 	it("records __parseError and pre-truncated __rawJson when partialParse fails on malformed JSON", async () => {
@@ -1155,7 +1207,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "error")).toBe(0);
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "hello" }]);
 	});
 
 	it("degrades to best-effort content when a raw SSE stream closes before message_stop", async () => {
@@ -1176,7 +1228,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "error")).toBe(0);
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "partial" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "partial" }]);
 	});
 
 	it("skips malformed raw SSE event frames and degrades to best-effort content", async () => {
@@ -1205,7 +1257,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(countEvents(events, "error")).toBe(0);
 		expect(countEvents(events, "done")).toBe(1);
 		expect(result.stopReason).toBe("stop");
-		expect(result.content).toEqual([{ type: "text", text: "" }]);
+		expect(JSON.parse(JSON.stringify(result.content))).toEqual([{ type: "text", text: "" }]);
 	});
 	it("surfaces a refusal fallback message when stop_details is null", async () => {
 		const refusalEvents: MockAnthropicEvent[] = [

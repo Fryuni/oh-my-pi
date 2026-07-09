@@ -1,5 +1,6 @@
 export { once, untilAborted } from "./abortable";
 export * from "./async";
+export * from "./binary";
 export * from "./color";
 export * from "./dirs";
 export * from "./env";
@@ -9,10 +10,12 @@ export * from "./frontmatter";
 export * from "./fs-error";
 export * from "./glob";
 export * from "./json";
+export * from "./json-parse";
 export * as logger from "./logger";
 export * from "./loop-phase";
 export * from "./mermaid-ascii";
 export * from "./mime";
+export * from "./path";
 export * from "./path-tree";
 export * from "./peek-file";
 export * as postmortem from "./postmortem";
@@ -26,6 +29,7 @@ export * from "./snowflake";
 export * from "./stream";
 export * from "./tab-spacing";
 export * from "./temp";
+export * from "./tls-fetch";
 export * from "./type-guards";
 export * from "./which";
 

@@ -11,6 +11,7 @@ import {
 	findCutPoint,
 	getLastAssistantUsage,
 	prepareCompaction,
+	resolveThresholdTokens,
 	shouldCompact,
 } from "@oh-my-pi/pi-agent-core/compaction/compaction";
 import * as ai from "@oh-my-pi/pi-ai";
@@ -239,6 +240,48 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(95000, 100000, settings)).toBe(true);
 		expect(shouldCompact(86000, 100000, settings)).toBe(true);
 		expect(shouldCompact(84000, 100000, settings)).toBe(false);
+	});
+
+	it("uses proportional reserve when the DEFAULTED reserve nearly consumes a small window", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			thresholdPercent: -1,
+			// reserveTokens deliberately unset: provenance, not value equality,
+			// is what allows the proportional fallback.
+			keepRecentTokens: 20_000,
+		};
+
+		// 16,385-token GPT-3.5 windows should keep the same 15% reserve behavior
+		// used by smaller windows instead of collapsing the threshold to one token.
+		expect(shouldCompact(10_000, 16_385, settings)).toBe(false);
+		expect(shouldCompact(13_929, 16_385, settings)).toBe(true);
+	});
+
+	it("honors an EXPLICIT reserve equal to the old default on a small window", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			thresholdPercent: -1,
+			reserveTokens: 16_384,
+			keepRecentTokens: 20_000,
+		};
+
+		// The user chose 16,384 on purpose; it must not be mistaken for the
+		// defaulted reserve and silently replaced with the proportional one.
+		expect(resolveThresholdTokens(16_385, settings)).toBe(1);
+		expect(shouldCompact(2, 16_385, settings)).toBe(true);
+	});
+
+	it("respects a large valid configured reserve", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			thresholdPercent: -1,
+			reserveTokens: 90_000,
+			keepRecentTokens: 20_000,
+		};
+
+		expect(resolveThresholdTokens(100_000, settings)).toBe(10_000);
+		expect(shouldCompact(10_000, 100_000, settings)).toBe(false);
+		expect(shouldCompact(10_001, 100_000, settings)).toBe(true);
 	});
 
 	it("should use configured threshold percent", () => {
@@ -510,10 +553,6 @@ describe("remote compaction setting", () => {
 		);
 		const fetchSpy = mockFetch(fetchHandler);
 		const completeSimpleSpy = vi.spyOn(ai, "completeSimple");
-		completeSimpleSpy
-			.mockResolvedValueOnce(createAssistantMessage("History summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Turn prefix summary"))
-			.mockResolvedValueOnce(createAssistantMessage("Short summary"));
 
 		const result = await compact(preparation, model, "test-api-key", undefined, undefined, {
 			fetch: fetchSpy,
@@ -534,7 +573,10 @@ describe("remote compaction setting", () => {
 				item => item.type === "reasoning" && item.encrypted_content === "encrypted_reasoning_turn_1",
 			),
 		).toBe(true);
-		expect(result.summary).toContain("History summary");
+		// V1 now matches V2: the provider-native replay is preserved and local
+		// summarization is skipped (no redundant LLM round), leaving the placeholder.
+		expect(result.summary).toContain("Remote compaction preserved provider-native history");
+		expect(completeSimpleSpy).not.toHaveBeenCalled();
 		expect(result.preserveData).toEqual({
 			openaiRemoteCompaction: {
 				provider: "openai",
@@ -786,6 +828,230 @@ describe("remote compaction setting", () => {
 
 		expect(result.preserveData).toEqual({ otherState: "keep-me" });
 	});
+
+	it("summarizes snapcompact archive text locally and stops carrying frames", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected anthropic/claude-sonnet-4-5 model to exist");
+
+		const oldUser = createMessageEntry(createUserMessage("Archived turn"));
+		const oldAssistant = createMessageEntry(createAssistantMessage("Archived answer"));
+		const previousCompaction = createCompactionEntry("Snapcompact frame summary", oldAssistant.id);
+		previousCompaction.preserveData = {
+			otherState: "keep-me",
+			snapcompact: {
+				frames: [{ data: "ZmFrZQ==", mimeType: "image/png", cols: 64, rows: 40, chars: 4 }],
+				totalChars: 31,
+				truncatedChars: 0,
+				text: "Archived snapcompact source",
+			},
+		};
+
+		const entries: SessionEntry[] = [
+			oldUser,
+			oldAssistant,
+			previousCompaction,
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(createAssistantMessage("Answer 1", createMockUsage(0, 100, 4000, 0))),
+			createMessageEntry(createUserMessage("Turn 2")),
+			createMessageEntry(createAssistantMessage("Answer 2", createMockUsage(0, 100, 9000, 0))),
+		];
+
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1000,
+			remoteEnabled: true,
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const completeSimpleSpy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValue(createAssistantMessage("History summary"));
+
+		const result = await compact(preparation, model, "test-api-key");
+		const promptText = completeSimpleSpy.mock.calls
+			.map(call => {
+				const context = call[1] as { messages?: Array<{ content?: Array<{ text?: string }> }> };
+				return context.messages?.[0]?.content?.[0]?.text ?? "";
+			})
+			.join("\n");
+
+		expect(promptText).toContain("Previous snapcompact archive source text:");
+		expect(promptText).toContain("Archived snapcompact source");
+		expect(result.preserveData).toEqual({ otherState: "keep-me" });
+	});
+
+	it("keeps snapcompact archive text when only split-turn prefix is summarized", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected anthropic/claude-sonnet-4-5 model to exist");
+
+		const oldUser = createMessageEntry(createUserMessage("Archived turn"));
+		const oldAssistant = createMessageEntry(createAssistantMessage("Archived answer"));
+		const previousCompaction = createCompactionEntry("Split snapcompact frame summary", oldAssistant.id);
+		previousCompaction.preserveData = {
+			otherState: "keep-me",
+			snapcompact: {
+				frames: [{ data: "ZmFrZQ==", mimeType: "image/png", cols: 64, rows: 40, chars: 4 }],
+				totalChars: 34,
+				truncatedChars: 0,
+				text: "Archived split snapcompact source",
+			},
+		};
+
+		const entries: SessionEntry[] = [
+			oldUser,
+			oldAssistant,
+			previousCompaction,
+			createMessageEntry(createUserMessage("Turn after archive")),
+			createMessageEntry(createAssistantMessage("Prefix answer")),
+			createMessageEntry(createAssistantMessage("Kept answer")),
+		];
+
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1,
+			remoteEnabled: true,
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+		expect(preparation.isSplitTurn).toBe(true);
+		expect(preparation.messagesToSummarize).toHaveLength(0);
+		expect(preparation.turnPrefixMessages.length).toBeGreaterThan(0);
+
+		const completeSimpleSpy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce(createAssistantMessage("Archived history summary"))
+			.mockResolvedValueOnce(createAssistantMessage("Turn prefix summary"))
+			.mockResolvedValueOnce(createAssistantMessage("Short summary"));
+
+		const result = await compact(preparation, model, "test-api-key");
+		const promptText = completeSimpleSpy.mock.calls
+			.map(call => {
+				const context = call[1] as { messages?: Array<{ content?: Array<{ text?: string }> }> };
+				return context.messages?.[0]?.content?.[0]?.text ?? "";
+			})
+			.join("\n");
+
+		expect(promptText).toContain("Archived split snapcompact source");
+		expect(result.summary).toContain("Archived history summary");
+		expect(result.summary).toContain("Turn prefix summary");
+		expect(result.summary).not.toContain("Archived split snapcompact source");
+		expect(result.summary).not.toContain("No prior history.");
+		expect(result.preserveData).toEqual({ otherState: "keep-me" });
+	});
+
+	it("strips legacy frame-only snapcompact archives during local compaction", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected anthropic/claude-sonnet-4-5 model to exist");
+
+		const oldUser = createMessageEntry(createUserMessage("Archived turn"));
+		const oldAssistant = createMessageEntry(createAssistantMessage("Archived answer"));
+		const previousCompaction = createCompactionEntry("Legacy snapcompact frame summary", oldAssistant.id);
+		previousCompaction.preserveData = {
+			otherState: "keep-me",
+			snapcompact: {
+				frames: [{ data: "ZmFrZQ==", mimeType: "image/png", cols: 64, rows: 40, chars: 4 }],
+				totalChars: 4,
+				truncatedChars: 0,
+			},
+		};
+
+		const entries: SessionEntry[] = [
+			oldUser,
+			oldAssistant,
+			previousCompaction,
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(createAssistantMessage("Answer 1", createMockUsage(0, 100, 4000, 0))),
+			createMessageEntry(createUserMessage("Turn 2")),
+			createMessageEntry(createAssistantMessage("Answer 2", createMockUsage(0, 100, 9000, 0))),
+		];
+
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1000,
+			remoteEnabled: true,
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("History summary"));
+
+		const result = await compact(preparation, model, "test-api-key");
+
+		expect(result.preserveData).toEqual({ otherState: "keep-me" });
+	});
+
+	it("sends snapcompact archive text to OpenAI remote compaction and strips frames", async () => {
+		const model = getBundledModel("openai", "gpt-5.1");
+		if (!model) throw new Error("Expected openai/gpt-5.1 model to exist");
+
+		const oldUser = createMessageEntry(createUserMessage("Archived turn"));
+		const oldAssistant = createMessageEntry(createAssistantMessage("Archived answer"));
+		const previousCompaction = createCompactionEntry("Snapcompact frame summary", oldAssistant.id);
+		previousCompaction.preserveData = {
+			otherState: "keep-me",
+			snapcompact: {
+				frames: [{ data: "ZmFrZQ==", mimeType: "image/png", cols: 64, rows: 40, chars: 4 }],
+				totalChars: 38,
+				truncatedChars: 0,
+				text: "Archived remote snapcompact source",
+			},
+		};
+
+		const entries: SessionEntry[] = [
+			oldUser,
+			oldAssistant,
+			previousCompaction,
+			createMessageEntry(createUserMessage("Turn 1")),
+			createMessageEntry(createOpenAiAssistantMessage("Answer 1", model, createMockUsage(0, 100, 4000, 0))),
+			createMessageEntry(createUserMessage("Turn 2")),
+			createMessageEntry(createOpenAiAssistantMessage("Answer 2", model, createMockUsage(0, 100, 9000, 0))),
+		];
+
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1000,
+			remoteEnabled: true,
+		});
+		if (!preparation) throw new Error("Expected compaction preparation");
+
+		const remoteOutput = [
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "Compacted retained user" }] },
+			{ type: "compaction", encrypted_content: "new_encrypted" },
+		];
+		const fetchHandler = vi.fn(
+			async (_input, _init) =>
+				new Response(JSON.stringify({ output: remoteOutput }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+		);
+		const fetchSpy = mockFetch(fetchHandler);
+		vi.spyOn(ai, "completeSimple").mockResolvedValue(createAssistantMessage("History summary"));
+
+		const result = await compact(preparation, model, "test-api-key", undefined, undefined, { fetch: fetchSpy });
+		const requestBody = JSON.parse(String(fetchHandler.mock.calls[0]?.[1]?.body)) as {
+			input: Array<{ type?: string; role?: string; content?: Array<{ type?: string; text?: string }> }>;
+		};
+		const archiveMessage = requestBody.input.find(
+			item =>
+				item.type === "message" &&
+				item.role === "user" &&
+				item.content?.some(
+					block =>
+						block.type === "input_text" &&
+						typeof block.text === "string" &&
+						block.text.includes("Archived remote snapcompact source"),
+				),
+		);
+
+		expect(archiveMessage).toBeDefined();
+		expect(result.preserveData).toEqual({
+			otherState: "keep-me",
+			openaiRemoteCompaction: {
+				provider: "openai",
+				replacementHistory: remoteOutput,
+				compactionItem: { type: "compaction", encrypted_content: "new_encrypted" },
+			},
+		});
+	});
 });
 
 describe("findCutPoint", () => {
@@ -950,8 +1216,10 @@ describe("buildSessionContext", () => {
 			collapseCompactedHistory: true,
 		});
 
-		expect(transcript.messages.map(m => m.role)).toEqual(["compactionSummary", "user", "user"]);
-		expect((transcript.messages[0] as { summary: string }).summary).toContain("Second summary");
+		expect(transcript.messages.map(m => m.role)).toEqual(["user", "compactionSummary", "user"]);
+		const summaryMsg = transcript.messages[1];
+		if (summaryMsg?.role !== "compactionSummary") throw new Error("Expected compaction summary at index 1");
+		expect(summaryMsg.summary).toContain("Second summary");
 		expect(transcript.cacheMissExplainedAt).toEqual([false, false, false]);
 	});
 
@@ -981,7 +1249,7 @@ describe("buildSessionContext", () => {
 		// The provider payload is attached to the summary for LLM replay only; the
 		// collapsed display must still emit the kept SessionEntry rows so a
 		// remotely-compacted session keeps its recent turns visible.
-		expect(transcript.messages.map(m => m.role)).toEqual(["compactionSummary", "user", "assistant", "user"]);
+		expect(transcript.messages.map(m => m.role)).toEqual(["user", "assistant", "compactionSummary", "user"]);
 		const dump = JSON.stringify(transcript.messages);
 		expect(dump).toContain("kept-user");
 		expect(dump).toContain("kept-assistant");
