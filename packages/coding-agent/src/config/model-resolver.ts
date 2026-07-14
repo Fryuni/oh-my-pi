@@ -37,7 +37,14 @@ import {
 	resolveThinkingLevelForModel,
 } from "../thinking";
 import { isAuthenticated, kNoAuth, type ModelRegistry } from "./model-registry";
-import { MODEL_ROLE_IDS, type ModelRole } from "./model-roles";
+import {
+	DEFAULT_MODEL_ROLE_ALIAS,
+	formatModelRoleAlias,
+	LEGACY_MODEL_ROLE_ALIAS_PREFIX,
+	MODEL_ROLE_ALIAS_PREFIX,
+	MODEL_ROLE_IDS,
+	type ModelRole,
+} from "./model-roles";
 import type { Settings } from "./settings";
 
 function isKnownProvider(provider: string): provider is KnownProvider {
@@ -79,23 +86,24 @@ export interface ScopedModel {
 }
 
 interface ThinkingSuffixOptions {
-	allowMaxAlias?: boolean;
+	allowMaxSuffix?: boolean;
 	allowAutoAlias?: boolean;
 }
 
 interface ModelStringParseOptions extends ThinkingSuffixOptions {
 	isLiteralModelId?: (provider: string, id: string) => boolean;
 }
-// Alias-suffix recognition for the model-pattern parser: `:max` maps to xhigh
-// and `:auto` maps to the auto sentinel. Both are gated behind the alias flags
-// (and the literal-id / exact-match guards on the callers) so a real model id
-// ending in `:max` / `:auto` isn't silently reinterpreted as a thinking suffix.
-const MAX_THINKING_SUFFIX_OPTIONS: ThinkingSuffixOptions = { allowMaxAlias: true, allowAutoAlias: true };
+// Suffix recognition for the model-pattern parser: `:max` is a real thinking
+// level and `:auto` maps to the auto sentinel. Both are gated behind flags
+// (and the literal-id / exact-match guards on the callers) because real model
+// ids end in `:max` (e.g. `glm-4.7:max`) — an ungated split would silently
+// reinterpret them as a thinking suffix.
+const MAX_THINKING_SUFFIX_OPTIONS: ThinkingSuffixOptions = { allowMaxSuffix: true, allowAutoAlias: true };
 
 function parseThinkingSuffix(value: string, options?: ThinkingSuffixOptions): ConfiguredThinkingLevel | undefined {
 	const level = parseThinkingLevel(value);
+	if (level === ThinkingLevel.Max) return options?.allowMaxSuffix === true ? level : undefined;
 	if (level !== undefined) return level;
-	if (options?.allowMaxAlias === true && value === "max") return ThinkingLevel.XHigh;
 	if (options?.allowAutoAlias === true && value === AUTO_THINKING) return AUTO_THINKING;
 	return undefined;
 }
@@ -104,11 +112,11 @@ function parseThinkingSuffix(value: string, options?: ThinkingSuffixOptions): Co
  * Split a trailing `:<level>` thinking selector off a model pattern.
  *
  * `level` is set when the suffix parses as a concrete thinking level (or, when
- * the caller opts in via `allowMaxAlias`/`allowAutoAlias`, the `:max` / `:auto`
- * aliases); `base` then has the suffix stripped. Otherwise `base` is the input.
+ * the caller opts in via `allowMaxSuffix`/`allowAutoAlias`, the guarded `:max`
+ * level / `:auto` sentinel); `base` then has the suffix stripped. Otherwise
+ * `base` is the input.
  * `minColonIndex` requires the colon to appear strictly after that index —
- * role-alias callers pass `PREFIX_MODEL_ROLE.length` so the base is at least
- * as long as the `pi/` prefix.
+ * role-alias callers pass the matched alias prefix length.
  */
 function splitThinkingSuffix(
 	pattern: string,
@@ -183,7 +191,7 @@ export function parseModelString(
 	// Strip strict thinking level suffixes first (e.g. "claude-sonnet-4-6:high" -> id "claude-sonnet-4-6", thinkingLevel "high").
 	const strict = splitThinkingSuffix(id);
 	if (strict.level) return { provider, id: strict.base, thinkingLevel: strict.level };
-	// `max` is a provider-facing alias for xhigh, but real model IDs can end in
+	// `max` is a real thinking level, but real model IDs can also end in
 	// `:max`. Context-aware callers pass a literal lookup so those models win.
 	const maxAlias = splitThinkingSuffix(id, -1, options);
 	if (maxAlias.level) {
@@ -239,7 +247,7 @@ function getOpenRouterRouteSuffix(modelId: string): { baseId: string; suffix: st
 	}
 
 	const suffix = modelId.slice(colonIdx + 1).trim();
-	// `max` is a thinking-level alias (xhigh), never an OpenRouter route suffix, so
+	// `max` is a thinking-level suffix, never an OpenRouter route suffix, so
 	// `openrouter/<id>:max` falls through to the max-aware selector split instead of
 	// being cloned into a literal `<id>:max` model id with the reasoning level lost.
 	if (!suffix || parseThinkingSuffix(suffix, MAX_THINKING_SUFFIX_OPTIONS)) {
@@ -766,7 +774,7 @@ function parseModelPatternWithContext(
 
 	// No match - try stripping a valid thinking suffix and recursing.
 	// `max` is accepted only after the full pattern failed, so literal model IDs
-	// ending in `:max` keep winning over the alias.
+	// ending in `:max` keep winning over the thinking suffix.
 	const { base, level } = splitThinkingSuffix(pattern, -1, MAX_THINKING_SUFFIX_OPTIONS);
 	if (level) {
 		const result = parseModelPatternWithContext(base, availableModels, context, options);
@@ -848,17 +856,32 @@ export function parseModelPattern(
 	);
 }
 
-const PREFIX_MODEL_ROLE = "pi/";
 const DEFAULT_MODEL_ROLE = "default";
+const MODEL_ROLE_ALIAS_PREFIXES = [MODEL_ROLE_ALIAS_PREFIX, LEGACY_MODEL_ROLE_ALIAS_PREFIX];
 
-function getModelRoleAlias(value: string): ModelRole | undefined {
+function isModelRole(role: string): role is ModelRole {
+	return (MODEL_ROLE_IDS as string[]).includes(role);
+}
+
+/**
+ * Minimum colon index for splitting a `:<level>` suffix off a role alias, or
+ * `undefined` when `value` is not role-alias shaped. Doubles as the slice
+ * offset of the role name for prefixed aliases (`@role`, `pi/role`); the bare
+ * `*` default alias returns 0 because its colon sits immediately after the
+ * one-character token (`*:xhigh`).
+ */
+function modelRoleAliasPrefixLength(value: string): number | undefined {
+	if (value === DEFAULT_MODEL_ROLE_ALIAS || value.startsWith(`${DEFAULT_MODEL_ROLE_ALIAS}:`)) return 0;
+	return MODEL_ROLE_ALIAS_PREFIXES.find(prefix => value.startsWith(prefix))?.length;
+}
+
+function getModelRoleAlias(value: string, settings?: Settings): string | undefined {
 	const normalized = value.trim();
-	if (!normalized.startsWith(PREFIX_MODEL_ROLE)) return undefined;
+	const prefixLength = modelRoleAliasPrefixLength(normalized);
+	if (prefixLength === undefined) return undefined;
 
-	const candidate = normalized.slice(PREFIX_MODEL_ROLE.length);
-	for (const role of MODEL_ROLE_IDS) {
-		if (candidate === role) return role;
-	}
+	const candidate = normalized === DEFAULT_MODEL_ROLE_ALIAS ? DEFAULT_MODEL_ROLE : normalized.slice(prefixLength);
+	if (isModelRole(candidate) || settings?.getModelRole(candidate) !== undefined) return candidate;
 	return undefined;
 }
 
@@ -869,7 +892,14 @@ function normalizeModelPatternList(value: string | string[] | undefined): string
 }
 
 function isSessionInheritedAgentPattern(value: string): boolean {
-	return value === DEFAULT_MODEL_ROLE || value === `${PREFIX_MODEL_ROLE}${DEFAULT_MODEL_ROLE}` || value === "pi/task";
+	return (
+		value === DEFAULT_MODEL_ROLE ||
+		value === formatModelRoleAlias(DEFAULT_MODEL_ROLE) ||
+		value === DEFAULT_MODEL_ROLE_ALIAS ||
+		value === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}${DEFAULT_MODEL_ROLE}` ||
+		value === formatModelRoleAlias("task") ||
+		value === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}task`
+	);
 }
 
 function shouldInheritDefaultBeforePriority(role: ModelRole): boolean {
@@ -902,7 +932,7 @@ function resolveDefaultInheritedPatterns(
 	configuredDefault: string | undefined,
 	roleDefaults: string[],
 	settings: Settings | undefined,
-	visited: Set<ModelRole>,
+	visited: Set<string>,
 ): string[] {
 	if (!shouldInheritDefaultBeforePriority(role) || !configuredDefault) return [];
 
@@ -910,13 +940,12 @@ function resolveDefaultInheritedPatterns(
 	for (const pattern of normalizeModelPatternList(configuredDefault)) {
 		const { base: aliasCandidate, level: thinkingLevel } = splitThinkingSuffix(
 			pattern,
-			PREFIX_MODEL_ROLE.length,
+			modelRoleAliasPrefixLength(pattern) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length,
 			MAX_THINKING_SUFFIX_OPTIONS,
 		);
-		const aliasRole = getModelRoleAlias(aliasCandidate);
+		const aliasRole = getModelRoleAlias(aliasCandidate, settings);
 		if (aliasRole === role) {
-			// Self-alias (e.g. modelRoles.default = "pi/smol") would loop back to the
-			// same unset role; collapse straight to the built-in priority chain.
+			// Self-alias (e.g. modelRoles.default = "@smol") would loop back to the
 			resolved.push(
 				...(thinkingLevel
 					? roleDefaults.map(defaultPattern => `${defaultPattern}:${thinkingLevel}`)
@@ -925,8 +954,7 @@ function resolveDefaultInheritedPatterns(
 			continue;
 		}
 		if (aliasRole && !visited.has(aliasRole)) {
-			// Cross-role alias (e.g. modelRoles.default = "pi/slow"): resolve the
-			// target role's patterns now so downstream one-layer expanders see
+			// Cross-role alias (e.g. modelRoles.default = "@slow"): resolve the
 			// concrete model patterns instead of another role alias.
 			const recursed = resolveConfiguredRolePattern(pattern, settings, new Set(visited));
 			if (recursed && recursed.length > 0) {
@@ -942,27 +970,29 @@ function resolveDefaultInheritedPatterns(
 function resolveConfiguredRolePattern(
 	value: string,
 	settings?: Settings,
-	visited: Set<ModelRole> = new Set(),
+	visited: Set<string> = new Set(),
 ): string[] | undefined {
 	const normalized = value.trim();
 	if (!normalized) return undefined;
 
 	const { base: aliasCandidate, level: thinkingLevel } = splitThinkingSuffix(
 		normalized,
-		PREFIX_MODEL_ROLE.length,
+		modelRoleAliasPrefixLength(normalized) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length,
 		MAX_THINKING_SUFFIX_OPTIONS,
 	);
-	const role = getModelRoleAlias(aliasCandidate);
+	const role = getModelRoleAlias(aliasCandidate, settings);
 	if (!role) return [normalized];
 	if (visited.has(role)) return undefined;
 	visited.add(role);
 
 	const configured = settings?.getModelRole(role)?.trim();
 	const configuredDefault = settings?.getModelRole(DEFAULT_MODEL_ROLE)?.trim();
-	const roleDefaults = rolePriorityDefaults(role);
+	const roleDefaults = isModelRole(role) ? rolePriorityDefaults(role) : [];
 	const resolved = configured
 		? normalizeModelPatternList(configured)
-		: resolveDefaultInheritedPatterns(role, configuredDefault, roleDefaults, settings, visited);
+		: isModelRole(role)
+			? resolveDefaultInheritedPatterns(role, configuredDefault, roleDefaults, settings, visited)
+			: roleDefaults;
 	if (resolved.length === 0) {
 		resolved.push(...roleDefaults);
 	}
@@ -974,7 +1004,7 @@ function resolveConfiguredRolePattern(
 }
 
 /**
- * Expand a role alias like "pi/smol" to the configured model string.
+ * Expand a role alias like "@smol" to the configured model string.
  */
 export function expandRoleAlias(value: string, settings?: Settings): string {
 	const normalized = value.trim();
@@ -1012,8 +1042,13 @@ export function resolveAgentModelPatterns(options: AgentModelPatternResolutionOp
 	const singleAgentPattern = normalizedAgentPatterns.length === 1 ? normalizedAgentPatterns[0] : undefined;
 	const agentInheritsSessionModel = singleAgentPattern ? isSessionInheritedAgentPattern(singleAgentPattern) : false;
 	if (configuredAgentPatterns.length > 0) {
+		if (
+			singleAgentPattern === formatModelRoleAlias("task") ||
+			singleAgentPattern === `${LEGACY_MODEL_ROLE_ALIAS_PREFIX}task`
+		) {
+			return configuredAgentPatterns;
+		}
 		if (!agentInheritsSessionModel) return configuredAgentPatterns;
-		if (singleAgentPattern === "pi/task") return configuredAgentPatterns;
 	}
 
 	const fallback =
@@ -1100,12 +1135,16 @@ export function extractExplicitThinkingSelector(
 	let current = normalized;
 	while (!visited.has(current)) {
 		visited.add(current);
-		const strictSelector = splitThinkingSuffix(current, PREFIX_MODEL_ROLE.length).level;
+		const rolePrefixLength = modelRoleAliasPrefixLength(current) ?? LEGACY_MODEL_ROLE_ALIAS_PREFIX.length;
+		const strictSelector = splitThinkingSuffix(current, rolePrefixLength).level;
 		if (strictSelector) {
 			return strictSelector;
 		}
-		const maxSelector = splitThinkingSuffix(current, PREFIX_MODEL_ROLE.length, MAX_THINKING_SUFFIX_OPTIONS).level;
-		if (maxSelector && (current.startsWith(PREFIX_MODEL_ROLE) || !isLiteralModelSelector(current, options))) {
+		const maxSelector = splitThinkingSuffix(current, rolePrefixLength, MAX_THINKING_SUFFIX_OPTIONS).level;
+		if (
+			maxSelector &&
+			(modelRoleAliasPrefixLength(current) !== undefined || !isLiteralModelSelector(current, options))
+		) {
 			return maxSelector;
 		}
 		const expanded = expandRoleAlias(current, settings).trim();
@@ -1276,7 +1315,7 @@ export function resolveAdvisorRoleSelection(
 	settings: Settings,
 	availableModels: Model<Api>[],
 ): { model: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel } | undefined {
-	const resolved = resolveModelRoleValue(`${PREFIX_MODEL_ROLE}advisor`, availableModels, {
+	const resolved = resolveModelRoleValue(formatModelRoleAlias("advisor"), availableModels, {
 		settings,
 		matchPreferences: getModelMatchPreferences(settings),
 	});
@@ -1298,6 +1337,7 @@ export async function resolveModelScope(
 	patterns: string[],
 	modelRegistry: Pick<ModelRegistry, "getAvailable">,
 	preferences?: ModelMatchPreferences,
+	settings?: Settings,
 ): Promise<ScopedModel[]> {
 	const availableModels = modelRegistry.getAvailable();
 	const context = buildPreferenceContext(availableModels, preferences);
@@ -1331,6 +1371,25 @@ export async function resolveModelScope(
 
 			for (const model of matchingModels) {
 				addScopedModel(model, thinkingLevel, explicitThinkingLevel);
+			}
+			continue;
+		}
+
+		// Role aliases (`@smol`, `pi/slow`) resolve to the role's single concrete
+		// model — not its whole fallback chain — so a role contributes one scope
+		// entry exactly like `--model` would pick. (Bare `*` stays a match-all
+		// glob above; scope semantics, not the default-role alias.)
+		if (settings && modelRoleAliasPrefixLength(pattern) !== undefined) {
+			const resolved = resolveModelRoleValue(pattern, availableModels, { settings, matchPreferences: preferences });
+			if (resolved.warning) logger.warn(resolved.warning);
+			if (!resolved.model) {
+				logger.warn(`No models match pattern "${pattern}"`);
+				continue;
+			}
+			if (resolved.thinkingLevel === AUTO_THINKING) {
+				addScopedModel(resolved.model, undefined, false);
+			} else {
+				addScopedModel(resolved.model, resolved.thinkingLevel, resolved.explicitThinkingLevel);
 			}
 			continue;
 		}
@@ -1384,7 +1443,7 @@ export async function resolveAllowedModels(
 	if (!patterns || patterns.length === 0) {
 		return available;
 	}
-	const scoped = await resolveModelScope(patterns, modelRegistry, preferences);
+	const scoped = await resolveModelScope(patterns, modelRegistry, preferences, settings);
 	if (scoped.length === 0) {
 		return [];
 	}
@@ -1413,6 +1472,7 @@ export async function resolveAllowedModels(
 export function filterAvailableModelsByEnabledPatterns(
 	available: Model<Api>[],
 	patterns: readonly string[],
+	settings?: Settings,
 ): Model<Api>[] {
 	if (patterns.length === 0) return available;
 
@@ -1427,6 +1487,13 @@ export function filterAvailableModelsByEnabledPatterns(
 			for (const model of resolveGlobScopePattern(pattern, available).models) {
 				addAllowed(model);
 			}
+			continue;
+		}
+
+		// Mirror resolveModelScope: role aliases resolve to the role's model.
+		if (settings && modelRoleAliasPrefixLength(pattern) !== undefined) {
+			const { model } = resolveModelRoleValue(pattern, available, { settings });
+			if (model) addAllowed(model);
 			continue;
 		}
 
@@ -1454,9 +1521,10 @@ export function resolveCliModel(options: {
 	cliProvider?: string;
 	cliModel?: string;
 	modelRegistry: CliModelRegistry;
+	settings?: Settings;
 	preferences?: ModelMatchPreferences;
 }): ResolveCliModelResult {
-	const { cliProvider, cliModel, modelRegistry, preferences } = options;
+	const { cliProvider, cliModel, modelRegistry, settings, preferences } = options;
 
 	if (!cliModel) {
 		return { model: undefined, selector: undefined, warning: undefined, error: undefined };
@@ -1470,6 +1538,19 @@ export function resolveCliModel(options: {
 			warning: undefined,
 			error: "No models available. Check your installation or add models to models.json.",
 		};
+	}
+
+	if (!cliProvider && modelRoleAliasPrefixLength(cliModel) !== undefined) {
+		const resolved = resolveModelRoleValue(cliModel, availableModels, { settings, matchPreferences: preferences });
+		if (resolved.model) {
+			return {
+				model: resolved.model,
+				selector: formatModelString(resolved.model),
+				thinkingLevel: resolved.thinkingLevel,
+				warning: resolved.warning,
+				error: undefined,
+			};
+		}
 	}
 
 	const providerMap = new Map<string, string>();

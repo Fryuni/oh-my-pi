@@ -7,15 +7,13 @@ import { Effort } from "@oh-my-pi/pi-ai";
 import { parseFrontmatter, prompt } from "@oh-my-pi/pi-utils";
 import { parseAgentFields } from "../discovery/helpers";
 import designerMd from "../prompts/agents/designer.md" with { type: "text" };
-import exploreMd from "../prompts/agents/explore.md" with { type: "text" };
 // Embed agent markdown files at build time
 import agentFrontmatterTemplate from "../prompts/agents/frontmatter.md" with { type: "text" };
 import librarianMd from "../prompts/agents/librarian.md" with { type: "text" };
-
-import planMd from "../prompts/agents/plan.md" with { type: "text" };
 import reviewerMd from "../prompts/agents/reviewer.md" with { type: "text" };
+import scoutMd from "../prompts/agents/scout.md" with { type: "text" };
 import taskMd from "../prompts/agents/task.md" with { type: "text" };
-import testerMd from "../prompts/agents/tester.md" with { type: "text" };
+import { AUTO_THINKING } from "../thinking";
 
 import type { AgentDefinition, AgentSource } from "./types";
 
@@ -42,19 +40,18 @@ function buildAgentContent(def: EmbeddedAgentDef): string {
 }
 
 const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
-	{ fileName: "explore.md", template: exploreMd },
-	{ fileName: "plan.md", template: planMd },
+	{ fileName: "scout.md", template: scoutMd },
 	{ fileName: "designer.md", template: designerMd },
 	{ fileName: "reviewer.md", template: reviewerMd },
 	{ fileName: "librarian.md", template: librarianMd },
-	{ fileName: "tester.md", template: testerMd },
 	{
 		fileName: "task.md",
 		frontmatter: {
 			name: "task",
 			description: "General-purpose subagent with full capabilities for delegated multi-step tasks",
 			spawns: "*",
-			model: "pi/task",
+			model: "@task",
+			thinkingLevel: AUTO_THINKING,
 		},
 		template: taskMd,
 	},
@@ -63,7 +60,7 @@ const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
 		frontmatter: {
 			name: "sonic",
 			description: "Low-reasoning agent for strictly mechanical updates or data collection only",
-			model: "pi/smol",
+			model: "@smol",
 			thinkingLevel: Effort.Medium,
 		},
 		template: taskMd,
