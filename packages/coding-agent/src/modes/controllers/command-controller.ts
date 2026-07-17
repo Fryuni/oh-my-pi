@@ -43,7 +43,7 @@ import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-stora
 import type { CompactMode } from "../../session/compact-modes";
 import type { NewSessionOptions } from "../../session/session-entries";
 import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
-import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
+import { formatActiveAccountLabel, limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
@@ -64,7 +64,7 @@ function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown:
 	block.addChild(new Spacer(1));
 	block.addChild(new Markdown(markdown.trim(), 1, 1, getMarkdownTheme()));
 	block.addChild(new DynamicBorder());
-	ctx.present(block);
+	ctx.presentCommandOutput(block);
 }
 
 export class CommandController {
@@ -515,7 +515,10 @@ export class CommandController {
 	}
 
 	handleToolsCommand(): void {
-		const tools = buildToolsMarkdown({ tools: this.ctx.session.agent.state.tools });
+		const tools = buildToolsMarkdown({
+			tools: this.ctx.session.agent.state.tools,
+			xdevTools: this.ctx.session.getXdevToolEntries(),
+		});
 		showMarkdownPanel(this.ctx, "Available Tools", tools);
 	}
 
@@ -990,6 +993,12 @@ export class CommandController {
 				return;
 			}
 		}
+		try {
+			await this.ctx.settings.flush();
+		} catch (err) {
+			this.ctx.showError(`Failed to save pending settings: ${err instanceof Error ? err.message : String(err)}`);
+			return;
+		}
 
 		try {
 			await this.ctx.sessionManager.moveTo(resolvedPath);
@@ -997,7 +1006,6 @@ export class CommandController {
 			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
-
 		await this.ctx.applyCwdChange(resolvedPath);
 
 		this.ctx.updateEditorBorderColor();
@@ -1300,7 +1308,7 @@ export class CommandController {
 }
 
 const BAR_WIDTH_MAX = 24;
-const BAR_WIDTH_MIN = 4;
+const COLUMN_WIDTH_MIN = 4;
 
 function renderJobLine(job: AsyncJobSnapshotItem, now: number): string {
 	const duration = formatDuration(Math.max(0, now - job.startTime));
@@ -1388,14 +1396,22 @@ function formatWindowSuffix(label: string, windowLabel: string, uiTheme: typeof 
 	return uiTheme.fg("dim", `(${windowLabel})`);
 }
 
+/** ` (org)` suffix when the report is org-attributed — two subscriptions can share one email. */
+function orgSuffix(report: UsageReport): string {
+	const orgName = report.metadata?.orgName;
+	const orgId = report.metadata?.orgId;
+	const org = typeof orgName === "string" && orgName ? orgName : typeof orgId === "string" ? orgId : undefined;
+	return org ? ` (${org})` : "";
+}
+
 function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: number): string {
 	const email = report.metadata?.email;
-	if (typeof email === "string" && email) return email;
+	if (typeof email === "string" && email) return `${email}${orgSuffix(report)}`;
 	const accountId =
 		typeof report.metadata?.accountId === "string" && report.metadata.accountId
 			? report.metadata.accountId
 			: limit.scope.accountId || undefined;
-	if (accountId) return accountId;
+	if (accountId) return `${accountId}${orgSuffix(report)}`;
 	const projectId =
 		typeof report.metadata?.projectId === "string" && report.metadata.projectId
 			? report.metadata.projectId
@@ -1406,9 +1422,9 @@ function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: numbe
 
 function formatUnlimitedReportLabel(report: UsageReport, index: number): string {
 	const email = report.metadata?.email;
-	if (typeof email === "string" && email) return email;
+	if (typeof email === "string" && email) return `${email}${orgSuffix(report)}`;
 	const accountId = report.metadata?.accountId;
-	if (typeof accountId === "string" && accountId) return accountId;
+	if (typeof accountId === "string" && accountId) return `${accountId}${orgSuffix(report)}`;
 	const projectId = report.metadata?.projectId;
 	if (typeof projectId === "string" && projectId) return projectId;
 	return `account ${index + 1}`;
@@ -1560,7 +1576,7 @@ function renderUsageBar(limit: UsageLimit, uiTheme: typeof theme, barWidth: numb
 }
 
 /**
- * Pick a per-column width so n bars + a trailing amount string fit in `available` columns.
+ * Pick a per-account column width so the columns and trailing amount fit in `available`.
  * Falls back to the minimum when the terminal is too narrow rather than wrapping.
  */
 function resolveColumnWidth(count: number, available: number, trailing: number): number {
@@ -1569,10 +1585,7 @@ function resolveColumnWidth(count: number, available: number, trailing: number):
 	const gaps = count - 1;
 	const spaceForBars = available - indent - gaps - (trailing > 0 ? trailing + 1 : 0);
 	const ideal = Math.floor(spaceForBars / count);
-	const min = BAR_WIDTH_MIN;
-	const max = BAR_WIDTH_MAX;
-	if (ideal < min) return min;
-	if (ideal > max) return max;
+	if (ideal < COLUMN_WIDTH_MIN) return COLUMN_WIDTH_MIN;
 	return ideal;
 }
 
@@ -1631,7 +1644,7 @@ export function renderUsageReports(
 		}
 
 		lines.push(uiTheme.bold(uiTheme.fg("accent", providerName)));
-		const activeAccountLabel = activeAccount?.email ?? activeAccount?.accountId ?? activeAccount?.projectId;
+		const activeAccountLabel = formatActiveAccountLabel(activeAccount);
 		if (activeAccountLabel) {
 			lines.push(`  ${uiTheme.fg("accent", "in use by this session:")} ${activeAccountLabel}`);
 		}
@@ -1708,6 +1721,7 @@ export function renderUsageReports(
 		const sectionCount = renderableGroups.reduce((max, g) => Math.max(max, g.sortedLimits.length), 0);
 		const sectionTrailing = renderableGroups.reduce((max, g) => Math.max(max, visibleWidth(g.amountText)), 0);
 		const sectionColumnWidth = resolveColumnWidth(sectionCount, availableWidth, sectionTrailing);
+		const sectionBarWidth = Math.min(sectionColumnWidth, BAR_WIDTH_MAX);
 
 		for (const { group, sortedLimits, sortedReports, amountText } of renderableGroups) {
 			const status = resolveAggregateStatus(sortedLimits);
@@ -1725,7 +1739,7 @@ export function renderUsageReports(
 			);
 			lines.push(`  ${accountLabels.join(" ")}`.trimEnd());
 			const bars = sortedLimits.map(limit =>
-				padColumn(renderUsageBar(limit, uiTheme, sectionColumnWidth), sectionColumnWidth),
+				padColumn(renderUsageBar(limit, uiTheme, sectionBarWidth), sectionColumnWidth),
 			);
 			lines.push(`  ${bars.join(" ")} ${amountText}`.trimEnd());
 			const resetText = sortedLimits.length <= 1 ? resolveResetRange(sortedLimits, nowMs) : null;
