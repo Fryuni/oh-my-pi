@@ -57,7 +57,7 @@ function completeModels(prefix: string): void {
 
 async function completeSessions(prefix: string): Promise<void> {
 	const cwd = process.cwd();
-	const settings = await Settings.init({ cwd });
+	const settings = await Settings.loadReadOnly({ cwd });
 	const mode = settings.get("workspace.identifier");
 	const sessions = await SessionManager.list(cwd, undefined, undefined, mode);
 	const lines: string[] = [];
