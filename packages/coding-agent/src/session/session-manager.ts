@@ -19,6 +19,7 @@ import {
 	toError,
 } from "@oh-my-pi/pi-utils";
 import type { WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
+import type { StructuredSubagentSchemaMode } from "../task/types";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
 import {
@@ -447,6 +448,13 @@ export class SessionManager {
 	#inMemoryArtifactCounter = 0;
 
 	#suppressBreadcrumb = false;
+	/**
+	 * The last breadcrumb this manager wrote marked a lazy `/new` boundary whose
+	 * JSONL is not yet on disk. Cleared (and the crumb re-stamped non-fresh) once
+	 * the session materializes, so a materialized-then-deleted session still falls
+	 * back to the most-recent session instead of being treated as a fresh crumb.
+	 */
+	#breadcrumbFresh = false;
 	#sessionNameChangedCallbacks = new Set<() => void>();
 
 	private constructor(
@@ -466,8 +474,18 @@ export class SessionManager {
 		if (persist && sessionDir) this.#storage.ensureDirSync(sessionDir);
 	}
 
-	#rememberBreadcrumb(cwd: string, sessionFile: string): void {
-		if (!this.#suppressBreadcrumb) writeTerminalBreadcrumb(cwd, sessionFile);
+	#rememberBreadcrumb(cwd: string, sessionFile: string, fresh = false): void {
+		this.#breadcrumbFresh = fresh;
+		if (!this.#suppressBreadcrumb) writeTerminalBreadcrumb(cwd, sessionFile, fresh);
+	}
+
+	/**
+	 * Re-stamp a fresh `/new` breadcrumb as non-fresh once the session has
+	 * materialized on disk. A no-op unless the current breadcrumb is still fresh.
+	 */
+	#materializeBreadcrumb(): void {
+		if (!this.#breadcrumbFresh || !this.#sessionFile) return;
+		this.#rememberBreadcrumb(this.#cwd, this.#sessionFile, false);
 	}
 
 	#clearDiskError(): void {
@@ -609,6 +627,7 @@ export class SessionManager {
 			this.#closeWriterEventually();
 			this.#storage.writeTextSync(this.#sessionFile, body);
 			this.#fileIsCurrent = true;
+			this.#materializeBreadcrumb();
 			this.#rewriteRequired = false;
 			this.#hasTitleSlot = true;
 		} catch (err) {
@@ -634,6 +653,7 @@ export class SessionManager {
 			async () => {
 				if (await this.#runFencedAtomicRewrite(startEpoch)) {
 					this.#fileIsCurrent = true;
+					this.#materializeBreadcrumb();
 					this.#rewriteRequired = false;
 					this.#hasTitleSlot = true;
 				}
@@ -816,7 +836,7 @@ export class SessionManager {
 			this.#sessionFile =
 				forcedSessionFile ??
 				path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
-			this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
+			this.#rememberBreadcrumb(this.#cwd, this.#sessionFile, true);
 		} else {
 			this.#sessionFile = undefined;
 		}
@@ -1567,6 +1587,8 @@ export class SessionManager {
 		task: string;
 		tools: string[];
 		outputSchema?: unknown;
+		outputSchemaMode?: StructuredSubagentSchemaMode;
+		restrictToolNames?: boolean;
 		spawns?: string;
 		readSummarize?: boolean;
 	}): string {
@@ -2021,6 +2043,8 @@ export class SessionManager {
 			task: string;
 			tools: string[];
 			outputSchema?: unknown;
+			outputSchemaMode?: StructuredSubagentSchemaMode;
+			restrictToolNames?: boolean;
 			spawns?: string;
 			readSummarize?: boolean;
 		} | null;
@@ -2039,6 +2063,8 @@ export class SessionManager {
 			task: string;
 			tools: string[];
 			outputSchema?: unknown;
+			outputSchemaMode?: StructuredSubagentSchemaMode;
+			restrictToolNames?: boolean;
 			spawns?: string;
 			readSummarize?: boolean;
 		} | null = null;
@@ -2050,6 +2076,8 @@ export class SessionManager {
 					task: entry.task,
 					tools: entry.tools,
 					outputSchema: entry.outputSchema,
+					outputSchemaMode: entry.outputSchemaMode,
+					restrictToolNames: entry.restrictToolNames,
 					readSummarize: entry.readSummarize,
 					spawns: entry.spawns,
 				};
@@ -2072,6 +2100,18 @@ export class SessionManager {
 		let chosenSession: string | null | undefined;
 
 		if (breadcrumb) {
+			// A fresh `/new` boundary whose JSONL was never materialized (lazy
+			// new-session persistence, then a process exit before any assistant
+			// output). Honor the boundary: start fresh rather than falling back to
+			// findMostRecentSession(), which would resurrect the pre-`/new`
+			// transcript. A materialized (or genuinely stale/deleted) crumb reports
+			// exists=false only when fresh, so this never masks a real stale crumb.
+			if (breadcrumb.fresh && !breadcrumb.exists) {
+				const manager = new SessionManager(cwd, dir, true, storage);
+				manager.#resetToNewSession();
+				return manager;
+			}
+
 			// Recover stale crumbs: a subagent open (pre-fix) may have pointed this
 			// terminal's breadcrumb at an artifact child; resume the parent instead.
 			breadcrumb.sessionFile = resolveBreadcrumbToInteractiveRoot(breadcrumb.sessionFile);

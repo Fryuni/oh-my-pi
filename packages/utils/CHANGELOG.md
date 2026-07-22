@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [17.0.5] - 2026-07-18
+
+### Changed
+
+- Updated `installRuntimeModuleResolver` to return an uninstaller function that restores the stock `node:module` resolver once all runtime roots are unregistered.
+- Added documentation regarding a known limitation with Bun 1.3.14's `createRequire` behavior when the module resolver patch is active.
+
+## [17.0.2] - 2026-07-17
+
 ### Added
 
 - Added a structured log sink API (`registerLogSink`, `LogEvent`, `LogLevel`) to the centralized logger, enabling out-of-band consumers (such as OpenTelemetry) to receive log events without affecting local file or console logging.
