@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
+import type { WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
 import { getMemoryRoot } from "../memories";
 import { getMnemopiSessionState, type MnemopiScopedMemoryHit, type MnemopiSessionState } from "../mnemopi/state";
 import { AgentRegistry } from "../registry/agent-registry";
@@ -10,6 +11,10 @@ import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, Ur
 
 const DEFAULT_MEMORY_FILE = "memory_summary.md";
 const MEMORY_NAMESPACE = "root";
+
+interface WorkspaceSettings {
+	get(key: "workspace.identifier"): WorkspaceIdentifierMode | undefined;
+}
 
 /**
  * Snapshot of memory roots for every registered session, deduped.
@@ -25,15 +30,29 @@ export function memoryRootsFromRegistry(): string[] {
 		const root = getMemoryRoot(
 			agentDir,
 			session.sessionManager.getCwd(),
-			session.settings.get("workspace.identifier"),
+			session.settings?.get("workspace.identifier") ?? "path",
 		);
 		if (root && !roots.includes(root)) roots.push(root);
 	}
 	return roots;
 }
 
+function isWorkspaceSettings(value: unknown): value is WorkspaceSettings {
+	return value !== null && typeof value === "object" && "get" in value && typeof value.get === "function";
+}
+
+function workspaceIdentifierModeFromContext(context?: ResolveContext): WorkspaceIdentifierMode {
+	const settings = context?.settings;
+	if (!isWorkspaceSettings(settings)) return "path";
+
+	const mode = settings.get("workspace.identifier");
+	return mode === "git-remote" || mode === "git-root" ? mode : "path";
+}
+
 function memoryRootsForContext(context?: ResolveContext): string[] {
-	if (context?.cwd) return [getMemoryRoot(getAgentDir(), context.cwd)];
+	if (context?.cwd) {
+		return [getMemoryRoot(getAgentDir(), context.cwd, workspaceIdentifierModeFromContext(context))];
+	}
 	return memoryRootsFromRegistry();
 }
 

@@ -55,6 +55,16 @@ async function withMemoryFixture(fn: (fixture: MemoryFixture) => Promise<void>):
 	}
 }
 
+async function runGit(cwd: string, args: readonly string[]): Promise<void> {
+	const child = Bun.spawn(["git", ...args], {
+		cwd,
+		env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_OPTIONAL_LOCKS: "0" },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if ((await child.exited) !== 0) throw new Error(`git ${args.join(" ")} failed`);
+}
+
 describe("MemoryProtocolHandler", () => {
 	beforeEach(() => {
 		AgentRegistry.resetGlobalForTests();
@@ -66,7 +76,7 @@ describe("MemoryProtocolHandler", () => {
 		InternalUrlRouter.resetForTests();
 	});
 
-	it("resolves memory://root to memory_summary.md", async () => {
+	it("resolves memory://root for a lightweight registered session without settings", async () => {
 		await withMemoryFixture(async ({ memoryRoot }) => {
 			await Bun.write(path.join(memoryRoot, "memory_summary.md"), "summary");
 
@@ -76,6 +86,34 @@ describe("MemoryProtocolHandler", () => {
 			expect(resource.content).toBe("summary");
 			expect(resource.contentType).toBe("text/markdown");
 		});
+	});
+
+	it("resolves memory://root in the caller's git-remote memory bucket", async () => {
+		const cleanupRoot = await fs.mkdtemp(path.join(os.tmpdir(), "memory-protocol-git-remote-"));
+		const previousAgentDir = getAgentDir();
+		try {
+			const agentDir = path.join(cleanupRoot, "agent");
+			const cwd = path.join(cleanupRoot, "project");
+			await fs.mkdir(cwd, { recursive: true });
+			await runGit(cwd, ["init"]);
+			await runGit(cwd, ["remote", "add", "origin", "git@github.com:owner/project.git"]);
+			setAgentDir(agentDir);
+
+			const memoryRoot = getMemoryRoot(agentDir, cwd, "git-remote");
+			await fs.mkdir(memoryRoot, { recursive: true });
+			await Bun.write(path.join(memoryRoot, "memory_summary.md"), "git remote summary");
+
+			const resource = await InternalUrlRouter.instance().resolve("memory://root", {
+				cwd,
+				settings: { get: () => "git-remote" },
+			});
+
+			expect(resource.content).toBe("git remote summary");
+			expect(resource.sourcePath).toBe(path.join(memoryRoot, "memory_summary.md"));
+		} finally {
+			setAgentDir(previousAgentDir);
+			await removeWithRetries(cleanupRoot);
+		}
 	});
 
 	it("resolves memory://root against the caller cwd when multiple sessions are live", async () => {
