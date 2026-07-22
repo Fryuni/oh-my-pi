@@ -8,6 +8,25 @@ import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
 import { makeAssistantMessage } from "./helpers";
 
+async function runGit(cwd: string, args: readonly string[]): Promise<void> {
+	const child = Bun.spawn(["git", ...args], {
+		cwd,
+		env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_OPTIONAL_LOCKS: "0" },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if ((await child.exited) !== 0) throw new Error(`git ${args.join(" ")} failed`);
+}
+
+async function createGitRemoteWorkspace(agentDir: string): Promise<{ cwd: string; nestedCwd: string }> {
+	const cwd = path.join(agentDir, "git-project");
+	const nestedCwd = path.join(cwd, "nested");
+	await runGit(agentDir, ["init", cwd]);
+	await runGit(cwd, ["remote", "add", "origin", "git@github.com:owner/project.git"]);
+	await fsp.mkdir(nestedCwd);
+	return { cwd, nestedCwd };
+}
+
 describe("SessionManager.continueRecent /new boundary", () => {
 	let testAgentDir: string;
 	let cwd: string;
@@ -67,6 +86,46 @@ describe("SessionManager.continueRecent /new boundary", () => {
 			expect(path.resolve(relaunched.getSessionFile() ?? "")).not.toBe(path.resolve(oldFile));
 		} finally {
 			await relaunched.close();
+		}
+	});
+
+	it("preserves git-remote managed roots after relaunching a lazy /new session", async () => {
+		const workspace = await createGitRemoteWorkspace(testAgentDir);
+		const mode = "git-remote" as const;
+		const old = SessionManager.create(workspace.cwd, undefined, undefined, mode);
+		old.appendMessage({ role: "user", content: "pre-new work", timestamp: 1 });
+		old.appendMessage(makeAssistantMessage());
+		await old.flush();
+		await old.close();
+
+		const resumed = await SessionManager.continueRecent(workspace.cwd, undefined, undefined, mode);
+		await resumed.newSession();
+		await resumed.close();
+
+		const relaunched = await SessionManager.continueRecent(workspace.cwd, undefined, undefined, mode);
+		try {
+			await relaunched.moveTo(workspace.nestedCwd);
+			expect(path.dirname(relaunched.getSessionFile() ?? "")).toBe(
+				SessionManager.getDefaultSessionDir(workspace.nestedCwd, undefined, undefined, mode),
+			);
+		} finally {
+			await relaunched.close();
+		}
+	});
+
+	it("preserves git-remote managed roots when cloning a session", async () => {
+		const workspace = await createGitRemoteWorkspace(testAgentDir);
+		const mode = "git-remote" as const;
+		const source = SessionManager.create(workspace.cwd, undefined, undefined, mode);
+		const clone = source.cloneCurrentSession();
+		try {
+			await clone.moveTo(workspace.nestedCwd);
+			expect(path.dirname(clone.getSessionFile() ?? "")).toBe(
+				SessionManager.getDefaultSessionDir(workspace.nestedCwd, undefined, undefined, mode),
+			);
+		} finally {
+			await clone.close();
+			await source.close();
 		}
 	});
 

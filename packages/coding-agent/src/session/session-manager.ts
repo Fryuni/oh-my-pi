@@ -972,7 +972,7 @@ export class SessionManager {
 	 */
 	cloneCurrentSession(options?: { persist?: boolean }): SessionManager {
 		const persist = options?.persist ?? this.#persist;
-		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage);
+		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage, this.#workspaceIdentifierMode);
 		clone.#suppressBreadcrumb = true;
 		clone.restoreState(this.captureState());
 		if (!persist) {
@@ -2107,7 +2107,7 @@ export class SessionManager {
 			// transcript. A materialized (or genuinely stale/deleted) crumb reports
 			// exists=false only when fresh, so this never masks a real stale crumb.
 			if (breadcrumb.fresh && !breadcrumb.exists) {
-				const manager = new SessionManager(cwd, dir, true, storage);
+				const manager = new SessionManager(cwd, dir, true, storage, mode);
 				manager.#resetToNewSession();
 				return manager;
 			}
