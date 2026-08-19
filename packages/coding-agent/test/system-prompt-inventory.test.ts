@@ -606,6 +606,38 @@ describe("system prompt tool inventory", () => {
 		expect(text).not.toContain("search-only-skill");
 	});
 
+	it("omits disable-agent-use skills from the listing while keeping normal skills", async () => {
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: tempDir,
+			contextFiles: [],
+			skills: [
+				{
+					name: "agent-blocked-skill",
+					description: "Agent must never see this",
+					filePath: path.join(tempDir, "SKILL.md"),
+					baseDir: tempDir,
+					source: "test",
+					disableAgentUse: true,
+				},
+				{
+					name: "normal-skill",
+					description: "Visible sibling",
+					filePath: path.join(tempDir, "SKILL.md"),
+					baseDir: tempDir,
+					source: "test",
+				},
+			],
+			rules: [],
+			toolNames: ["read"],
+			tools: TOOLS,
+			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
+		});
+		const text = systemPrompt.join("\n\n");
+
+		expect(text).not.toContain("agent-blocked-skill");
+		expect(text).toContain("- normal-skill: Visible sibling");
+	});
+
 	it("omits hidden skills even when read is active", async () => {
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,

@@ -30,7 +30,7 @@ import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
-import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
+import { buildSkillPromptMessage, isAgentDisabled, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
 import type { MCPManager } from "../mcp/manager";
@@ -3293,9 +3293,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			unsubscribe = monitor.attach(session);
 
 			checkAbort();
-			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>)
+			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>).
+			// `disable-agent-use` skills are unreachable to agents: skip injection
+			// (they remain user-invocable via /skill:<name>).
 			if (options.autoloadSkills?.length) {
 				for (const skill of options.autoloadSkills) {
+					if (isAgentDisabled(skill)) continue;
 					const { message } = await buildSkillPromptMessage(skill, "", "autoload");
 					await session.sendCustomMessage(
 						{

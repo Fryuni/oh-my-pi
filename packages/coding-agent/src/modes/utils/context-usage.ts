@@ -4,7 +4,7 @@ import { effectiveReserveTokens, estimateTokens, resolveThresholdTokens } from "
 import type { Tool as AiTool, Model } from "@oh-my-pi/pi-ai";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { formatNumber } from "@oh-my-pi/pi-utils";
-import type { Skill } from "../../extensibility/skills";
+import { isAgentDisabled, type Skill } from "../../extensibility/skills";
 import type { AgentSession } from "../../session/agent-session";
 import { estimateInlineSavings, type SnapcompactSavingsEstimate } from "../../session/snapcompact-inline";
 import type { Tool } from "../../tools";
@@ -59,8 +59,10 @@ const EMPTY_SKILLS: readonly Skill[] = [];
 /**
  * Skills actually rendered into the system prompt, mirroring the filter in
  * `buildSystemPrompt` (`system-prompt.ts`): the `read` tool must be present so
- * the model can fetch skill content, and skills with frontmatter `hide: true`
- * (or `disable-model-invocation`, normalized onto `hide`) are excluded.
+ * the model can fetch skill content, and skills excluded from the rendered
+ * prompt's `<skills>` listing (`hide: true` / `disable-model-invocation`,
+ * normalized onto `hide`) or gated from the agent entirely
+ * (`disable-agent-use: true`, via {@link isAgentDisabled}) are not counted.
  * Accounting must count only these so the Skills category and the System-prompt
  * subtraction stay aligned with the provider-facing prompt.
  */
@@ -69,7 +71,7 @@ function renderedSkills(
 	tools: ReadonlyArray<Pick<Tool, "name" | "description" | "parameters">>,
 ): readonly Skill[] {
 	if (!tools.some(tool => tool.name === "read")) return EMPTY_SKILLS;
-	return skills.filter(skill => skill.hide !== true);
+	return skills.filter(skill => skill.hide !== true && !isAgentDisabled(skill));
 }
 
 export function estimateSkillsTokens(skills: readonly Skill[]): number {

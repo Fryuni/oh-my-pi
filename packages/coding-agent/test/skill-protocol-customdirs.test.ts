@@ -163,3 +163,66 @@ describe("skill:// resolution honors skills.customDirectories (#7190)", () => {
 		expect(resource.content).toContain("from custom");
 	});
 });
+
+describe("skill:// resolution gates disable-agent-use skills", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(async () => {
+		resetActiveSkillsForTests();
+		for (const dir of tempDirs) await fs.rm(dir, { recursive: true, force: true });
+		tempDirs.length = 0;
+	});
+
+	it("treats a disable-agent-use skill as unknown while a sibling stays resolvable", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-agent-gated-skills-"));
+		tempDirs.push(tempDir);
+		const skillDir = path.join(tempDir, "agent-blocked");
+		await fs.mkdir(skillDir, { recursive: true });
+		await Bun.write(path.join(skillDir, "SKILL.md"), makeSkillMd("agent-blocked", tempDir));
+		const siblingDir = path.join(tempDir, "agent-allowed");
+		await fs.mkdir(siblingDir, { recursive: true });
+		await Bun.write(path.join(siblingDir, "SKILL.md"), makeSkillMd("agent-allowed", tempDir));
+
+		const { skills } = await loadSkills({
+			...ALL_DEFAULT_SOURCES_DISABLED,
+			customDirectories: [tempDir],
+		});
+		const blocked = skills.find(s => s.name === "agent-blocked");
+		if (!blocked) throw new Error("expected agent-blocked skill to load");
+		// Simulate the loader normalizing `disable-agent-use: true` frontmatter.
+		setActiveSkills([{ ...blocked, disableAgentUse: true }, ...skills.filter(s => s !== blocked)]);
+
+		const handler = new SkillProtocolHandler();
+		await expect(handler.resolve(parseInternalUrl("skill://agent-blocked/"))).rejects.toThrow(
+			"Unknown skill: agent-blocked",
+		);
+		// The error must not leak the gated skill as an available name.
+		await expect(handler.resolve(parseInternalUrl("skill://agent-blocked/"))).rejects.toThrow(
+			"Available: agent-allowed",
+		);
+
+		const resource = await handler.resolve(parseInternalUrl("skill://agent-allowed/"));
+		expect(resource.sourcePath).toBe(path.join(siblingDir, "SKILL.md"));
+	});
+
+	it("keeps hide-only skills reachable via skill:// (hide is listing-only)", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-hide-skill-"));
+		tempDirs.push(tempDir);
+		const skillDir = path.join(tempDir, "hidden-skill");
+		await fs.mkdir(skillDir, { recursive: true });
+		await Bun.write(path.join(skillDir, "SKILL.md"), makeSkillMd("hidden-skill", tempDir));
+
+		const { skills } = await loadSkills({
+			...ALL_DEFAULT_SOURCES_DISABLED,
+			customDirectories: [tempDir],
+		});
+		const hidden = skills.find(s => s.name === "hidden-skill");
+		if (!hidden) throw new Error("expected hidden-skill to load");
+		setActiveSkills([{ ...hidden, hide: true }]);
+
+		const handler = new SkillProtocolHandler();
+		const resource = await handler.resolve(parseInternalUrl("skill://hidden-skill/"));
+		expect(resource.sourcePath).toBe(path.join(skillDir, "SKILL.md"));
+		expect(resource.content).toContain(`from ${tempDir}`);
+	});
+});

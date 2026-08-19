@@ -94,6 +94,8 @@ const SKILL_FIELDS: Record<string, true> = {
 	"allowed-tools": true,
 	metadata: true,
 	compatibility: true,
+	"disable-command-use": true,
+	"disable-agent-use": true,
 };
 /** Skill `name` characters: Unicode letters/digits (Python `str.isalnum`) and hyphens. */
 const SKILL_NAME_CHARS_RE = /^[\p{L}\p{N}-]+$/u;
@@ -155,6 +157,11 @@ export function validateAgentSkillFrontmatter(frontmatter: Record<string, unknow
 	const allowedTools = frontmatter["allowed-tools"];
 	if (allowedTools !== undefined && typeof allowedTools !== "string") {
 		return `"allowed-tools" must be a string`;
+	}
+
+	for (const flag of ["disable-command-use", "disable-agent-use"] as const) {
+		const value = frontmatter[flag];
+		if (value !== undefined && typeof value !== "boolean") return `"${flag}" must be a boolean`;
 	}
 
 	return null;

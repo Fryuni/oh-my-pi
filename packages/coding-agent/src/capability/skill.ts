@@ -28,6 +28,18 @@ export interface SkillFrontmatter {
 	 * @see https://agentskills.io/specification
 	 */
 	disableModelInvocation?: boolean;
+	/**
+	 * When `true`, the user cannot invoke the skill as a `/skill:<name>`
+	 * command. Opt-out: absent/false leaves command use enabled.
+	 * Normalized from kebab-case `disable-command-use` in YAML frontmatter.
+	 */
+	disableCommandUse?: boolean;
+	/**
+	 * When `true`, the agent cannot invoke the skill (system-prompt listing,
+	 * `skill://` reads, subagent autoload). Opt-out: absent/false leaves
+	 * agent use enabled. Normalized from kebab-case `disable-agent-use`.
+	 */
+	disableAgentUse?: boolean;
 	[key: string]: unknown;
 }
 

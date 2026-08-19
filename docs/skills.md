@@ -57,6 +57,8 @@ Supported frontmatter fields on the skill type:
 - `alwaysApply?: boolean`
 - `hide?: boolean`
 - `disableModelInvocation?: boolean` (Agent Skills equivalent of `hide`; normalized from kebab-case `disable-model-invocation`)
+- `disable-command-use?: boolean` (normalized to `disableCommandUse`)
+- `disable-agent-use?: boolean` (normalized to `disableAgentUse`)
 - additional keys are preserved as unknown metadata
 
 Current runtime behavior:
@@ -136,6 +138,21 @@ System prompt construction (`src/system-prompt.ts`) uses discovered skills as fo
   - omit discovered list
 
 `hide: true` does not disable the skill. Hidden skills are still loaded and remain reachable through `skill://<name>` and `/skill:<name>` when skill commands are enabled.
+
+### Per-surface opt-outs: `disable-command-use` / `disable-agent-use`
+
+These two flags are **opt-out**: absent or `false` leaves that surface enabled.
+
+- `disable-command-use: true` — the user cannot invoke the skill as a `/skill:<name>` slash command.
+- `disable-agent-use: true` — the agent cannot invoke the skill: it is excluded from the system-prompt skill listing, `skill://` reads, and subagent autoload.
+
+If **both** are `true`, the skill loads but is reachable from no surface. The loader emits a warning (a `SkillWarning` with `kind: "unusable"`) and the TUI shows it once at startup; non-interactive runs print it to stderr.
+
+How they differ from `hide` / `disable-model-invocation`:
+
+- `hide` / `disable-model-invocation` are **listing-only**: the skill disappears from the system-prompt `<skills>` listing but stays fully reachable by both the agent (`skill://`) and the user (`/skill:<name>`).
+- `disable-agent-use` is a **hard agent gate**: no prompt listing, no `skill://` resolution, no autoload.
+- `disable-command-use` is a **hard user gate**: no `/skill:<name>` command.
 
 Task tool subagents receive the session's discovered/provided skills list via normal session creation; there is no per-task skill pinning override.
 

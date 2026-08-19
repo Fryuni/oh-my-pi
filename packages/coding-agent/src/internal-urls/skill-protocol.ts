@@ -12,7 +12,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { resolveContainedPath } from "../discovery/contained-path";
-import { getActiveSkills } from "../extensibility/skills";
+import { getActiveSkills, isAgentDisabled } from "../extensibility/skills";
 import { isMarkdownPath } from "../utils/lang-from-path";
 import { buildDirectoryResource } from "./filesystem-resource";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
@@ -56,9 +56,12 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			throw new Error("skill:// URL requires a skill name: skill://<name>");
 		}
 
-		const skill = skills.find(s => s.name === skillName);
+		// `disable-agent-use` is a hard gate: the skill must be indistinguishable
+		// from an unknown name to the agent (still user-invocable via /skill:).
+		const agentSkills = skills.filter(s => !isAgentDisabled(s));
+		const skill = agentSkills.find(s => s.name === skillName);
 		if (!skill) {
-			const available = skills.map(s => s.name);
+			const available = agentSkills.map(s => s.name);
 			const availableStr = available.length > 0 ? available.join(", ") : "none";
 			throw new Error(`Unknown skill: ${skillName}\nAvailable: ${availableStr}`);
 		}

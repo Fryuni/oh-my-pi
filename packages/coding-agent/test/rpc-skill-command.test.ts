@@ -44,6 +44,41 @@ describe("tryRunRpcSkillCommand", () => {
 		await removeWithRetries(dir);
 	});
 
+	test("rejects /skill commands for skills with disableCommandUse", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), `omp-rpc-skill-${Snowflake.next()}-`));
+		const skillPath = path.join(dir, "SKILL.md");
+		await Bun.write(
+			skillPath,
+			"---\nname: hidden\ndescription: Hidden skill\n---\n\nDo hidden things.\n",
+		);
+		let prompted = false;
+		try {
+			const handled = await tryRunRpcSkillCommand(
+				{
+					skillsSettings: { enableSkillCommands: true },
+					skills: [
+						{
+							name: "hidden",
+							description: "Hidden skill",
+							filePath: skillPath,
+							baseDir: dir,
+							source: "project",
+							disableCommandUse: true,
+						},
+					],
+					async promptCustomMessage() {
+						prompted = true;
+					},
+				},
+				"/skill:hidden do the thing",
+			);
+			expect(handled).toBe(false);
+			expect(prompted).toBe(false);
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
 	test("honors the RPC prompt streaming behavior for registered /skill commands", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), `omp-rpc-skill-${Snowflake.next()}-`));
 		const skillPath = path.join(dir, "SKILL.md");

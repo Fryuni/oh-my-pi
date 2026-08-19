@@ -6,11 +6,13 @@ import { type Skill as CapabilitySkill, skillCapability } from "@oh-my-pi/pi-cod
 import { getCapability } from "@oh-my-pi/pi-coding-agent/discovery";
 import { getWslWindowsHomeCandidate, runHostProbe } from "@oh-my-pi/pi-coding-agent/discovery/agents";
 import {
+	formatUnusableSkillWarnings,
 	type LoadSkillsResult,
 	loadSkills,
 	loadSkillsFromDir,
 	parseSkillInvocation,
 	type Skill,
+	type SkillWarning,
 } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
@@ -589,6 +591,140 @@ describe("collision handling", () => {
 		expect(skillMap.get("calendar")?.source).toBe("first");
 		expect(collisionWarnings).toHaveLength(1);
 		expect(collisionWarnings[0].message).toContain("name collision");
+	});
+});
+
+describe("disable-command-use / disable-agent-use flags", () => {
+	const writeSkill = async (root: string, name: string, frontmatter: string): Promise<void> => {
+		const skillDir = path.join(root, name);
+		await fs.mkdir(skillDir, { recursive: true });
+		await fs.writeFile(path.join(skillDir, "SKILL.md"), `---\n${frontmatter}\n---\n\n# ${name}\n`);
+	};
+
+	it("lifts both flags from kebab-case YAML frontmatter", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skill-flags-kebab-"));
+		try {
+			await writeSkill(
+				tempDir,
+				"both-disabled",
+				"name: both-disabled\ndescription: Both surfaces disabled.\ndisable-command-use: true\ndisable-agent-use: true",
+			);
+			const { skills } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [tempDir] });
+			const skill = skills.find(s => s.name === "both-disabled");
+			expect(skill).toBeDefined();
+			expect(skill!.disableCommandUse).toBe(true);
+			expect(skill!.disableAgentUse).toBe(true);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("lifts camelCase frontmatter keys and treats absent/false as enabled", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skill-flags-camel-"));
+		try {
+			await writeSkill(
+				tempDir,
+				"camel-skill",
+				"name: camel-skill\ndescription: CamelCase keys.\ndisableCommandUse: true\ndisableAgentUse: true",
+			);
+			await writeSkill(
+				tempDir,
+				"plain-skill",
+				"name: plain-skill\ndescription: No flags.\ndisable-command-use: false",
+			);
+			const { skills, warnings } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [tempDir] });
+			const camel = skills.find(s => s.name === "camel-skill");
+			expect(camel!.disableCommandUse).toBe(true);
+			expect(camel!.disableAgentUse).toBe(true);
+			const plain = skills.find(s => s.name === "plain-skill");
+			expect(plain!.disableCommandUse).toBe(false);
+			expect(plain!.disableAgentUse).toBe(false);
+			expect(warnings.filter(w => w.kind === "unusable")).toHaveLength(1);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("does not warn for skills with only one surface disabled", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skill-flags-single-"));
+		try {
+			await writeSkill(
+				tempDir,
+				"command-only",
+				"name: command-only\ndescription: Commands disabled only.\ndisable-command-use: true",
+			);
+			await writeSkill(
+				tempDir,
+				"agent-only",
+				"name: agent-only\ndescription: Agent use disabled only.\ndisable-agent-use: true",
+			);
+			const { skills, warnings } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [tempDir] });
+			expect(skills.find(s => s.name === "command-only")!.disableCommandUse).toBe(true);
+			expect(skills.find(s => s.name === "command-only")!.disableAgentUse).toBe(false);
+			expect(skills.find(s => s.name === "agent-only")!.disableAgentUse).toBe(true);
+			expect(skills.find(s => s.name === "agent-only")!.disableCommandUse).toBe(false);
+			expect(warnings.filter(w => w.kind === "unusable")).toHaveLength(0);
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("warns with kind unusable when both surfaces are disabled", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skill-flags-unusable-"));
+		try {
+			await writeSkill(
+				tempDir,
+				"dead-skill",
+				"name: dead-skill\ndescription: Nothing can reach this.\ndisable-command-use: true\ndisable-agent-use: true",
+			);
+			const { warnings } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [tempDir] });
+			const unusable = warnings.filter(w => w.kind === "unusable");
+			expect(unusable).toHaveLength(1);
+			expect(unusable[0].skillPath).toBe(path.join(tempDir, "dead-skill", "SKILL.md"));
+			expect(unusable[0].message).toContain("dead-skill");
+			expect(unusable[0].message).toContain("both user commands and agent invocation");
+		} finally {
+			await removeWithRetries(tempDir);
+		}
+	});
+
+	it("tags name-collision warnings with kind collision", async () => {
+		const { warnings } = await loadSkills({
+			...DISABLE_ALL_BUILTIN_SKILLS,
+			customDirectories: [path.join(collisionFixturesDir, "first"), path.join(collisionFixturesDir, "second")],
+		});
+		const collisions = warnings.filter(w => w.message.includes("name collision"));
+		expect(collisions.length).toBeGreaterThan(0);
+		expect(collisions.every(w => w.kind === "collision")).toBe(true);
+	});
+
+	describe("formatUnusableSkillWarnings", () => {
+		it("returns undefined when no unusable warnings exist", () => {
+			expect(formatUnusableSkillWarnings([])).toBeUndefined();
+			const warnings: SkillWarning[] = [{ kind: "collision", skillPath: "/a/SKILL.md", message: "name collision" }];
+			expect(formatUnusableSkillWarnings(warnings)).toBeUndefined();
+		});
+
+		it("formats every unusable warning with its path and message", () => {
+			const warnings: SkillWarning[] = [
+				{
+					kind: "unusable",
+					skillPath: "/skills/dead/SKILL.md",
+					message: 'skill "dead" is disabled for both user commands and agent invocation and cannot be used',
+				},
+				{
+					kind: "unusable",
+					skillPath: "/skills/gone/SKILL.md",
+					message: 'skill "gone" is disabled for both user commands and agent invocation and cannot be used',
+				},
+			];
+			const formatted = formatUnusableSkillWarnings(warnings);
+			expect(formatted).toBeDefined();
+			expect(formatted).toContain("2 skill(s)");
+			expect(formatted).toContain("/skills/dead/SKILL.md");
+			expect(formatted).toContain("/skills/gone/SKILL.md");
+			expect(formatted).toContain("disabled for both user commands and agent invocation");
+		});
 	});
 });
 

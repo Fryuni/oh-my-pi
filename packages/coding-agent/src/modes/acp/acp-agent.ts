@@ -878,7 +878,7 @@ export class AcpAgent implements Agent {
 			return false;
 		}
 		const skill = record.session.skills.find(candidate => candidate.name === parsed.name);
-		if (!skill) {
+		if (!skill || skill.disableCommandUse === true) {
 			return false;
 		}
 		const built = await buildSkillPromptMessage(skill, parsed.args, "user");

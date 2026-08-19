@@ -61,6 +61,31 @@ describe("buildAvailableSlashCommands", () => {
 		expect(byName.notes.source).toBe("file");
 	});
 
+	test("excludes skills with disableCommandUse while keeping sibling skills", async () => {
+		const session = {
+			customCommands: [],
+			skills: [
+				{ name: "reviewer", description: "Review code", filePath: "/tmp/reviewer/SKILL.md" },
+				{
+					name: "hidden",
+					description: "Hidden skill",
+					filePath: "/tmp/hidden/SKILL.md",
+					disableCommandUse: true,
+				},
+			],
+			skillsSettings: { enableSkillCommands: true },
+			sessionManager: { getCwd: () => process.cwd() },
+			setSlashCommands() {},
+		};
+
+		const commands = await buildAvailableSlashCommands(session as never, async () => []);
+		const byName = Object.fromEntries(commands.map(command => [command.name, command]));
+
+		expect(byName["skill:hidden"]).toBeUndefined();
+		expect(byName["skill:reviewer"]).toBeDefined();
+		expect(byName["skill:reviewer"].source).toBe("skill");
+	});
+
 	test("loads file commands into the session before advertising them", async () => {
 		const fileCommands = [{ name: "notes", description: "Open notes", content: "body", source: "test" }];
 		let loadedCommands: typeof fileCommands | undefined;

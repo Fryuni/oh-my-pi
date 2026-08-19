@@ -53,6 +53,7 @@ import {
 } from "./discovery/helpers";
 import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
+import { formatUnusableSkillWarnings } from "./extensibility/skills";
 import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
@@ -1818,6 +1819,17 @@ export async function runRootCommand(
 
 		if (modelFallbackMessage) {
 			notifs.push({ kind: "warn", message: modelFallbackMessage });
+		}
+
+		// Surface skills disabled for BOTH user commands and agent invocation —
+		// they load fine but can never be reached, so flag them once at startup.
+		const unusableSkillsWarning = formatUnusableSkillWarnings(session.skillWarnings);
+		if (unusableSkillsWarning) {
+			if (isInteractive) {
+				notifs.push({ kind: "warn", message: unusableSkillsWarning });
+			} else {
+				process.stderr.write(`${chalk.yellow(`${unusableSkillsWarning}\n`)}`);
+			}
 		}
 
 		const modelRegistryError = modelRegistry.getError();

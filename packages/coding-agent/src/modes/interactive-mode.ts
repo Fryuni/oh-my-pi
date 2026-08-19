@@ -1301,6 +1301,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.skillCommands.clear();
 		if (this.session.skillsSettings?.enableSkillCommands !== false) {
 			for (const skill of this.session.skills) {
+				if (skill.disableCommandUse === true) continue;
 				const commandName = `skill:${skill.name}`;
 				this.skillCommands.set(commandName, skill);
 				commands.push({ name: commandName, description: skill.description });

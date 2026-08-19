@@ -7,6 +7,7 @@ import {
 	sanitizeManagedDescription,
 } from "../autolearn/managed-skills";
 import { skillCapability } from "../capability/skill";
+import type { SkillFrontmatter } from "../capability/skill";
 import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
 import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
@@ -28,6 +29,17 @@ export interface Skill {
 	 */
 	hide?: boolean;
 	/**
+	 * When `true`, the user cannot invoke the skill as a `/skill:<name>`
+	 * command. Opt-out: absent/false leaves command use enabled.
+	 */
+	disableCommandUse?: boolean;
+	/**
+	 * When `true`, the agent cannot invoke the skill (system-prompt listing,
+	 * `skill://` reads, subagent autoload). Opt-out: absent/false leaves
+	 * agent use enabled.
+	 */
+	disableAgentUse?: boolean;
+	/**
 	 * Filesystem-resolved plugin root for Agent Plugin skills (spec §4.1):
 	 * every `skill://` resource access must realpath-resolve within it.
 	 */
@@ -36,14 +48,62 @@ export interface Skill {
 	_source?: SourceMeta;
 }
 
+/**
+ * Hard gate for agent-facing surfaces: a skill with frontmatter
+ * `disable-agent-use: true` must be invisible and unreachable to the model —
+ * excluded from the system-prompt `<skills>` listing, `skill://` resolution,
+ * subagent autoload injection, and token accounting — while remaining
+ * user-invocable via `/skill:<name>`.
+ */
+export function isAgentDisabled(skill: Skill): boolean {
+	return skill.disableAgentUse === true;
+}
+
 export interface SkillWarning {
 	skillPath: string;
 	message: string;
+	/**
+	 * Warning category. `"collision"` for skill-name collisions, `"unusable"`
+	 * for skills disabled for both user commands and agent invocation.
+	 * Warnings predating categorization carry no kind.
+	 */
+	kind?: "collision" | "unusable";
 }
 
 export interface LoadSkillsResult {
 	skills: Skill[];
 	warnings: SkillWarning[];
+}
+
+/**
+ * Lift the frontmatter-controlled boolean flags shared by every skill source
+ * into runtime `Skill` shape. All strict `=== true` so absent/false/mistyped
+ * values keep the opt-in default. `hide` additionally honors the Agent Skills
+ * `disableModelInvocation` alias — behavior unchanged by this refactor.
+ */
+function liftSkillFlags(
+	frontmatter: SkillFrontmatter | undefined,
+): Pick<Skill, "hide" | "disableCommandUse" | "disableAgentUse"> {
+	return {
+		hide: frontmatter?.hide === true || frontmatter?.disableModelInvocation === true,
+		disableCommandUse: frontmatter?.disableCommandUse === true,
+		disableAgentUse: frontmatter?.disableAgentUse === true,
+	};
+}
+
+/**
+ * Format all `unusable` skill warnings (skills disabled for BOTH user
+ * commands and agent invocation) as a single multi-line startup warning.
+ * Returns `undefined` when there is nothing to surface.
+ */
+export function formatUnusableSkillWarnings(warnings: readonly SkillWarning[]): string | undefined {
+	const unusable = warnings.filter(warning => warning.kind === "unusable");
+	if (unusable.length === 0) return undefined;
+	const lines = unusable.map(warning => `  - ${warning.skillPath}: ${warning.message}`);
+	return [
+		`${unusable.length} skill(s) are disabled for both user commands and agent invocation and cannot be used:`,
+		...lines,
+	].join("\n");
 }
 
 let activeSkills: readonly Skill[] = [];
@@ -110,7 +170,7 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 			source: options.source,
 			...(capSkill.containRoot !== undefined && { containRoot: capSkill.containRoot }),
-			hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
+			...liftSkillFlags(capSkill.frontmatter),
 			_source: capSkill._source,
 		})),
 		warnings: (result.warnings ?? []).map(message => ({ skillPath: options.dir, message })),
@@ -235,6 +295,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		const existing = skillMap.get(capSkill.name);
 		if (existing) {
 			collisionWarnings.push({
+				kind: "collision",
 				skillPath: capSkill.path,
 				message: `name collision: "${capSkill.name}" already loaded from ${existing.filePath}, skipping this one`,
 			});
@@ -246,7 +307,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 				baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 				source: `${capSkill._source.provider}:${capSkill.level}`,
 				...(capSkill.containRoot !== undefined && { containRoot: capSkill.containRoot }),
-				hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
+				...liftSkillFlags(capSkill.frontmatter),
 				_source: capSkill._source,
 			});
 			realPathSet.add(resolvedPath);
@@ -284,7 +345,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 					baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 					source: "custom:user",
 					...(capSkill.containRoot !== undefined && { containRoot: capSkill.containRoot }),
-					hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
+					...liftSkillFlags(capSkill.frontmatter),
 					_source: { ...capSkill._source, providerName: "Custom" },
 				},
 				path: capSkill.path,
@@ -322,6 +383,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 				continue;
 			}
 			collisionWarnings.push({
+				kind: "collision",
 				skillPath: skill.filePath,
 				message: `name collision: "${skill.name}" already loaded from ${existing.filePath}, skipping this one`,
 			});
@@ -385,18 +447,32 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 			source: `${capSkill._source.provider}:${capSkill.level}`,
 			...(capSkill.containRoot !== undefined && { containRoot: capSkill.containRoot }),
-			hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
+			...liftSkillFlags(capSkill.frontmatter),
 			_source: capSkill._source,
 		});
 		realPathSet.add(resolvedPath);
 	}
 
 	const skills = Array.from(skillMap.values());
+	// A skill opted out of BOTH surfaces (user `/skill:<name>` commands and
+	// agent invocation) can never be reached — warn so the misconfiguration
+	// is visible instead of the skill silently doing nothing.
+	const unusableWarnings: SkillWarning[] = skills
+		.filter(skill => skill.disableCommandUse === true && skill.disableAgentUse === true)
+		.map(skill => ({
+			kind: "unusable" as const,
+			skillPath: skill.filePath,
+			message: `skill "${skill.name}" is disabled for both user commands and agent invocation and cannot be used`,
+		}));
 	// Deterministic ordering for prompt stability (case-insensitive, then exact name, then path).
 	skills.sort((a, b) => compareSkillOrder(a.name, a.filePath, b.name, b.filePath));
 	return {
 		skills,
-		warnings: [...(result.warnings ?? []).map(w => ({ skillPath: "", message: w })), ...collisionWarnings],
+		warnings: [
+			...(result.warnings ?? []).map(w => ({ skillPath: "", message: w })),
+			...collisionWarnings,
+			...unusableWarnings,
+		],
 	};
 }
 

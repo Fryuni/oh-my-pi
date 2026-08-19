@@ -123,7 +123,7 @@ export async function tryRunRpcSkillCommand(
 	const parsed = parseSkillInvocation(text);
 	if (!parsed) return false;
 	const skill = session.skills.find(candidate => candidate.name === parsed.name);
-	if (!skill) return false;
+	if (!skill || skill.disableCommandUse === true) return false;
 	const built = await buildSkillPromptMessage(skill, parsed.args, "user");
 	await session.promptCustomMessage(
 		{

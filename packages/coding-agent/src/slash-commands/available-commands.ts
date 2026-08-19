@@ -55,6 +55,7 @@ export async function buildAvailableSlashCommands(
 
 	if (session.skillsSettings?.enableSkillCommands) {
 		for (const skill of session.skills) {
+			if (skill.disableCommandUse === true) continue;
 			appendCommand({
 				name: getSkillSlashCommandName(skill),
 				description: skill.description || `Run ${skill.name} skill`,

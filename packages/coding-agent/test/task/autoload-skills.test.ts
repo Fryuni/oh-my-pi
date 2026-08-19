@@ -174,6 +174,67 @@ describe("autoloadSkills in executor", () => {
 		);
 	});
 
+	it("does not inject disable-agent-use skills but keeps normal ones", async () => {
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-1",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const blockedSkill: Skill = {
+			name: "agent-blocked-skill",
+			description: "Agent must never load this",
+			filePath: "/skills/agent-blocked-skill/SKILL.md",
+			baseDir: "/skills/agent-blocked-skill",
+			source: "user",
+			disableAgentUse: true,
+		};
+		const normalSkill: Skill = {
+			name: "normal-skill",
+			description: "Loadable",
+			filePath: "/skills/normal-skill/SKILL.md",
+			baseDir: "/skills/normal-skill",
+			source: "user",
+		};
+
+		vi.spyOn(skillsModule, "buildSkillPromptMessage").mockImplementation(async skill => ({
+			message: `Content of ${skill.name}\n\n---\n\nSkill: ${skill.filePath}`,
+			details: {
+				name: skill.name,
+				path: skill.filePath,
+				args: undefined,
+				lineCount: 1,
+			},
+		}));
+
+		await runSubprocess({
+			...baseOptions,
+			skills: [blockedSkill, normalSkill],
+			autoloadSkills: [blockedSkill, normalSkill],
+		});
+
+		const sendCustomMessage = session.sendCustomMessage as Mock<any>;
+		expect(sendCustomMessage).toHaveBeenCalledTimes(1);
+		expect(sendCustomMessage).toHaveBeenCalledWith(
+			{
+				customType: SKILL_PROMPT_MESSAGE_TYPE,
+				content: expect.stringContaining("Content of normal-skill"),
+				display: false,
+				details: { name: "normal-skill", path: "/skills/normal-skill/SKILL.md" },
+			},
+			{ triggerTurn: false },
+		);
+	});
+
 	it("does not call sendCustomMessage when autoloadSkills is empty", async () => {
 		const session = createMockSession(({ emit }) => {
 			emit({
