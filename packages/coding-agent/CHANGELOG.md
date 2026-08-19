@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added skill frontmatter flags `disable-command-use` and `disable-agent-use` (opt-out; absent/false keeps each surface enabled). `disable-command-use: true` hides the skill from `/skill:<name>` slash-command registration, autocomplete, available-commands, and RPC/ACP dispatch; `disable-agent-use: true` is a hard agent gate excluding the skill from the system-prompt `<skills>` listing, `skill://` reads (resolves as unknown), subagent autoload injection, and token accounting. A skill with both flags set produces a startup warning in the TUI (stderr in non-interactive modes).
+- Added skill frontmatter flag `disable-command-use` (opt-out; absent/false keeps the surface enabled) and hardened `disable-model-invocation` (Agent Skills standard) from listing-only into a full agent gate. `disable-command-use: true` hides the skill from `/skill:<name>` slash-command registration, autocomplete, available-commands, and RPC/ACP dispatch. `disable-model-invocation: true` now excludes the skill from the system-prompt `<skills>` listing, `skill://` reads (resolves as unknown), subagent autoload injection, and token accounting — the skill remains user-invocable via `/skill:<name>`. A skill with both flags set produces a startup warning in the TUI (stderr in non-interactive modes).
 
 ## [17.3.7] - 2026-08-17
 

@@ -833,7 +833,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	// Filter skills for the rendered system prompt:
 	// - require the `read` tool so the model can actually fetch skill content;
 	// - drop skills with frontmatter `hide: true` (still loadable via skill:// and /skill:<name>);
-	// - drop skills with `disable-agent-use: true` (hard gate: invisible and unreachable to the model).
+	// - drop skills with `disable-model-invocation: true` (hard gate: invisible and unreachable to the model).
 	const hasRead = toolNames.includes("read");
 	const filteredSkills = hasRead ? skills.filter(skill => skill.hide !== true && !isAgentDisabled(skill)) : [];
 

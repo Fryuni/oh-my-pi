@@ -3294,8 +3294,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			checkAbort();
 			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>).
-			// `disable-agent-use` skills are unreachable to agents: skip injection
-			// (they remain user-invocable via /skill:<name>).
+			// `disable-model-invocation` skills are unreachable to agents: skip
+			// injection (they remain user-invocable via /skill:<name>).
 			if (options.autoloadSkills?.length) {
 				for (const skill of options.autoloadSkills) {
 					if (isAgentDisabled(skill)) continue;

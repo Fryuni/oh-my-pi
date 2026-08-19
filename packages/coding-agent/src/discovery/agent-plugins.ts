@@ -177,7 +177,7 @@ async function scanStandardSkills(realRoot: string, level: "user" | "project"): 
 			// Validation guarantees the frontmatter name matches the directory
 			// (NFKC-normalized), so the on-disk directory name is the identity.
 			// Store with the codebase's camelCase key convention (skill:// consumers,
-			// prompt hiding via disableModelInvocation, …).
+			// agent gating via disableModelInvocation, …).
 			const frontmatter = normalizeFrontmatterKeys(rawFrontmatter) as SkillFrontmatter;
 			items.push({
 				name: entry.name,

@@ -34,11 +34,12 @@ export interface Skill {
 	 */
 	disableCommandUse?: boolean;
 	/**
-	 * When `true`, the agent cannot invoke the skill (system-prompt listing,
-	 * `skill://` reads, subagent autoload). Opt-out: absent/false leaves
-	 * agent use enabled.
+	 * Hard agent gate (Agent Skills standard). When `true`, the agent cannot
+	 * invoke the skill: excluded from the system-prompt `<skills>` listing,
+	 * `skill://` reads, and subagent autoload. Opt-out: absent/false leaves
+	 * agent use enabled. The skill remains user-invocable via `/skill:<name>`.
 	 */
-	disableAgentUse?: boolean;
+	disableModelInvocation?: boolean;
 	/**
 	 * Filesystem-resolved plugin root for Agent Plugin skills (spec §4.1):
 	 * every `skill://` resource access must realpath-resolve within it.
@@ -50,13 +51,13 @@ export interface Skill {
 
 /**
  * Hard gate for agent-facing surfaces: a skill with frontmatter
- * `disable-agent-use: true` must be invisible and unreachable to the model —
- * excluded from the system-prompt `<skills>` listing, `skill://` resolution,
- * subagent autoload injection, and token accounting — while remaining
- * user-invocable via `/skill:<name>`.
+ * `disable-model-invocation: true` (Agent Skills standard) must be invisible
+ * and unreachable to the model — excluded from the system-prompt `<skills>`
+ * listing, `skill://` resolution, subagent autoload injection, and token
+ * accounting — while remaining user-invocable via `/skill:<name>`.
  */
 export function isAgentDisabled(skill: Skill): boolean {
-	return skill.disableAgentUse === true;
+	return skill.disableModelInvocation === true;
 }
 
 export interface SkillWarning {
@@ -78,16 +79,17 @@ export interface LoadSkillsResult {
 /**
  * Lift the frontmatter-controlled boolean flags shared by every skill source
  * into runtime `Skill` shape. All strict `=== true` so absent/false/mistyped
- * values keep the opt-in default. `hide` additionally honors the Agent Skills
- * `disableModelInvocation` alias — behavior unchanged by this refactor.
+ * values keep the opt-in default. `hide` is listing-only (still reachable via
+ * `skill://` and `/skill:<name>`); `disableModelInvocation` is the hard agent
+ * gate lifted to its own runtime field.
  */
 function liftSkillFlags(
 	frontmatter: SkillFrontmatter | undefined,
-): Pick<Skill, "hide" | "disableCommandUse" | "disableAgentUse"> {
+): Pick<Skill, "hide" | "disableCommandUse" | "disableModelInvocation"> {
 	return {
-		hide: frontmatter?.hide === true || frontmatter?.disableModelInvocation === true,
+		hide: frontmatter?.hide === true,
 		disableCommandUse: frontmatter?.disableCommandUse === true,
-		disableAgentUse: frontmatter?.disableAgentUse === true,
+		disableModelInvocation: frontmatter?.disableModelInvocation === true,
 	};
 }
 
@@ -458,7 +460,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// agent invocation) can never be reached — warn so the misconfiguration
 	// is visible instead of the skill silently doing nothing.
 	const unusableWarnings: SkillWarning[] = skills
-		.filter(skill => skill.disableCommandUse === true && skill.disableAgentUse === true)
+		.filter(skill => skill.disableCommandUse === true && skill.disableModelInvocation === true)
 		.map(skill => ({
 			kind: "unusable" as const,
 			skillPath: skill.filePath,

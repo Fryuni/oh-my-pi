@@ -22,8 +22,11 @@ export interface SkillFrontmatter {
 	 */
 	hide?: boolean;
 	/**
-	 * Agent Skills standard equivalent of `hide`.
-	 * When `true`, the skill is excluded from the system prompt listing.
+	 * Hard agent gate (Agent Skills standard).
+	 * When `true`, the agent cannot invoke the skill: excluded from the
+	 * system-prompt `<skills>` listing, `skill://` resolution, and subagent
+	 * autoload. Opt-out: absent/false leaves agent use enabled. The skill
+	 * remains user-invocable via `/skill:<name>`.
 	 * Normalized from kebab-case `disable-model-invocation` in YAML frontmatter.
 	 * @see https://agentskills.io/specification
 	 */
@@ -34,12 +37,6 @@ export interface SkillFrontmatter {
 	 * Normalized from kebab-case `disable-command-use` in YAML frontmatter.
 	 */
 	disableCommandUse?: boolean;
-	/**
-	 * When `true`, the agent cannot invoke the skill (system-prompt listing,
-	 * `skill://` reads, subagent autoload). Opt-out: absent/false leaves
-	 * agent use enabled. Normalized from kebab-case `disable-agent-use`.
-	 */
-	disableAgentUse?: boolean;
 	[key: string]: unknown;
 }
 

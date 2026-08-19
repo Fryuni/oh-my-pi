@@ -174,7 +174,7 @@ describe("autoloadSkills in executor", () => {
 		);
 	});
 
-	it("does not inject disable-agent-use skills but keeps normal ones", async () => {
+	it("does not inject disable-model-invocation skills but keeps normal ones", async () => {
 		const session = createMockSession(({ emit }) => {
 			emit({
 				type: "tool_execution_end",
@@ -196,7 +196,7 @@ describe("autoloadSkills in executor", () => {
 			filePath: "/skills/agent-blocked-skill/SKILL.md",
 			baseDir: "/skills/agent-blocked-skill",
 			source: "user",
-			disableAgentUse: true,
+		disableModelInvocation: true,
 		};
 		const normalSkill: Skill = {
 			name: "normal-skill",

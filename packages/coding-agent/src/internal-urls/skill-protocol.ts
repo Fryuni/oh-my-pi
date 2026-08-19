@@ -56,8 +56,8 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			throw new Error("skill:// URL requires a skill name: skill://<name>");
 		}
 
-		// `disable-agent-use` is a hard gate: the skill must be indistinguishable
-		// from an unknown name to the agent (still user-invocable via /skill:).
+	// `disable-model-invocation` is a hard gate: the skill must be indistinguishable
+	// from an unknown name to the agent (still user-invocable via /skill:).
 		const agentSkills = skills.filter(s => !isAgentDisabled(s));
 		const skill = agentSkills.find(s => s.name === skillName);
 		if (!skill) {

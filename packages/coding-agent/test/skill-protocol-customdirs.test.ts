@@ -164,7 +164,7 @@ describe("skill:// resolution honors skills.customDirectories (#7190)", () => {
 	});
 });
 
-describe("skill:// resolution gates disable-agent-use skills", () => {
+describe("skill:// resolution gates disable-model-invocation skills", () => {
 	const tempDirs: string[] = [];
 
 	afterEach(async () => {
@@ -173,7 +173,7 @@ describe("skill:// resolution gates disable-agent-use skills", () => {
 		tempDirs.length = 0;
 	});
 
-	it("treats a disable-agent-use skill as unknown while a sibling stays resolvable", async () => {
+	it("treats a disable-model-invocation skill as unknown while a sibling stays resolvable", async () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-agent-gated-skills-"));
 		tempDirs.push(tempDir);
 		const skillDir = path.join(tempDir, "agent-blocked");
@@ -189,8 +189,8 @@ describe("skill:// resolution gates disable-agent-use skills", () => {
 		});
 		const blocked = skills.find(s => s.name === "agent-blocked");
 		if (!blocked) throw new Error("expected agent-blocked skill to load");
-		// Simulate the loader normalizing `disable-agent-use: true` frontmatter.
-		setActiveSkills([{ ...blocked, disableAgentUse: true }, ...skills.filter(s => s !== blocked)]);
+		// Simulate the loader normalizing `disable-model-invocation: true` frontmatter.
+		setActiveSkills([{ ...blocked, disableModelInvocation: true }, ...skills.filter(s => s !== blocked)]);
 
 		const handler = new SkillProtocolHandler();
 		await expect(handler.resolve(parseInternalUrl("skill://agent-blocked/"))).rejects.toThrow(

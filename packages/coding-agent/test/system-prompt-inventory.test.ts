@@ -606,7 +606,7 @@ describe("system prompt tool inventory", () => {
 		expect(text).not.toContain("search-only-skill");
 	});
 
-	it("omits disable-agent-use skills from the listing while keeping normal skills", async () => {
+	it("omits disable-model-invocation skills from the listing while keeping normal skills", async () => {
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,
 			contextFiles: [],
@@ -617,7 +617,7 @@ describe("system prompt tool inventory", () => {
 					filePath: path.join(tempDir, "SKILL.md"),
 					baseDir: tempDir,
 					source: "test",
-					disableAgentUse: true,
+					disableModelInvocation: true,
 				},
 				{
 					name: "normal-skill",

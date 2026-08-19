@@ -60,11 +60,10 @@ const EMPTY_SKILLS: readonly Skill[] = [];
  * Skills actually rendered into the system prompt, mirroring the filter in
  * `buildSystemPrompt` (`system-prompt.ts`): the `read` tool must be present so
  * the model can fetch skill content, and skills excluded from the rendered
- * prompt's `<skills>` listing (`hide: true` / `disable-model-invocation`,
- * normalized onto `hide`) or gated from the agent entirely
- * (`disable-agent-use: true`, via {@link isAgentDisabled}) are not counted.
- * Accounting must count only these so the Skills category and the System-prompt
- * subtraction stay aligned with the provider-facing prompt.
+ * prompt's `<skills>` listing (`hide: true`) or gated from the agent entirely
+ * (`disable-model-invocation: true`, via {@link isAgentDisabled}) are not
+ * counted. Accounting must count only these so the Skills category and the
+ * System-prompt subtraction stay aligned with the provider-facing prompt.
  */
 function renderedSkills(
 	skills: readonly Skill[],

@@ -1,4 +1,4 @@
-import { beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,9 +15,26 @@ import {
 	type SkillWarning,
 } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
 
 const fixturesDir = path.resolve(import.meta.dirname, "fixtures/skills");
 const collisionFixturesDir = path.resolve(import.meta.dirname, "fixtures/skills-collision");
+
+// Managed-skill discovery is unconditional by design (cf. #2401): provider
+// toggles never hide it. Redirect the agent dir to a temp home for the whole
+// file so managed skills minted into the developer's real
+// `~/.omp/agent/managed-skills` can never leak into these assertions.
+let originalAgentDir = "";
+let hermeticAgentDir = "";
+beforeAll(async () => {
+	originalAgentDir = getAgentDir();
+	hermeticAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-skills-test-agent-"));
+	setAgentDir(hermeticAgentDir);
+});
+afterAll(async () => {
+	setAgentDir(originalAgentDir);
+	if (hermeticAgentDir) await fs.rm(hermeticAgentDir, { recursive: true, force: true });
+});
 
 const longSkillName = "this-is-a-very-long-skill-name-that-exceeds-the-sixty-four-character-limit-set-by-the-standard";
 const expectedFixtureSkillOrder: string[] = [
@@ -432,7 +449,7 @@ enabled: false
 			}
 		});
 
-		it("should hide skills with disable-model-invocation frontmatter (Agent Skills spec)", async () => {
+		it("should hard-gate agents from skills with disable-model-invocation frontmatter (Agent Skills spec)", async () => {
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-dmi-skill-"));
 			const skillDir = path.join(tempDir, "hidden-by-spec");
 			await fs.mkdir(skillDir, { recursive: true });
@@ -445,7 +462,9 @@ enabled: false
 				const { skills } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [tempDir] });
 				const skill = skills.find(s => s.name === "hidden-by-spec");
 				expect(skill).toBeDefined();
-				expect(skill!.hide).toBe(true);
+				// Hard agent gate — not merely hidden from the prompt listing.
+				expect(skill!.disableModelInvocation).toBe(true);
+			expect(skill!.hide).not.toBe(true);
 			} finally {
 				await removeWithRetries(tempDir);
 			}
@@ -594,7 +613,7 @@ describe("collision handling", () => {
 	});
 });
 
-describe("disable-command-use / disable-agent-use flags", () => {
+describe("disable-command-use / disable-model-invocation flags", () => {
 	const writeSkill = async (root: string, name: string, frontmatter: string): Promise<void> => {
 		const skillDir = path.join(root, name);
 		await fs.mkdir(skillDir, { recursive: true });
@@ -607,13 +626,13 @@ describe("disable-command-use / disable-agent-use flags", () => {
 			await writeSkill(
 				tempDir,
 				"both-disabled",
-				"name: both-disabled\ndescription: Both surfaces disabled.\ndisable-command-use: true\ndisable-agent-use: true",
+				"name: both-disabled\ndescription: Both surfaces disabled.\ndisable-command-use: true\ndisable-model-invocation: true",
 			);
 			const { skills } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [tempDir] });
 			const skill = skills.find(s => s.name === "both-disabled");
 			expect(skill).toBeDefined();
 			expect(skill!.disableCommandUse).toBe(true);
-			expect(skill!.disableAgentUse).toBe(true);
+			expect(skill!.disableModelInvocation).toBe(true);
 		} finally {
 			await removeWithRetries(tempDir);
 		}
@@ -625,7 +644,7 @@ describe("disable-command-use / disable-agent-use flags", () => {
 			await writeSkill(
 				tempDir,
 				"camel-skill",
-				"name: camel-skill\ndescription: CamelCase keys.\ndisableCommandUse: true\ndisableAgentUse: true",
+				"name: camel-skill\ndescription: CamelCase keys.\ndisableCommandUse: true\ndisableModelInvocation: true",
 			);
 			await writeSkill(
 				tempDir,
@@ -635,10 +654,10 @@ describe("disable-command-use / disable-agent-use flags", () => {
 			const { skills, warnings } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [tempDir] });
 			const camel = skills.find(s => s.name === "camel-skill");
 			expect(camel!.disableCommandUse).toBe(true);
-			expect(camel!.disableAgentUse).toBe(true);
+			expect(camel!.disableModelInvocation).toBe(true);
 			const plain = skills.find(s => s.name === "plain-skill");
 			expect(plain!.disableCommandUse).toBe(false);
-			expect(plain!.disableAgentUse).toBe(false);
+			expect(plain!.disableModelInvocation).toBe(false);
 			expect(warnings.filter(w => w.kind === "unusable")).toHaveLength(1);
 		} finally {
 			await removeWithRetries(tempDir);
@@ -656,12 +675,12 @@ describe("disable-command-use / disable-agent-use flags", () => {
 			await writeSkill(
 				tempDir,
 				"agent-only",
-				"name: agent-only\ndescription: Agent use disabled only.\ndisable-agent-use: true",
+				"name: agent-only\ndescription: Agent use disabled only.\ndisable-model-invocation: true",
 			);
 			const { skills, warnings } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [tempDir] });
 			expect(skills.find(s => s.name === "command-only")!.disableCommandUse).toBe(true);
-			expect(skills.find(s => s.name === "command-only")!.disableAgentUse).toBe(false);
-			expect(skills.find(s => s.name === "agent-only")!.disableAgentUse).toBe(true);
+			expect(skills.find(s => s.name === "command-only")!.disableModelInvocation).toBe(false);
+			expect(skills.find(s => s.name === "agent-only")!.disableModelInvocation).toBe(true);
 			expect(skills.find(s => s.name === "agent-only")!.disableCommandUse).toBe(false);
 			expect(warnings.filter(w => w.kind === "unusable")).toHaveLength(0);
 		} finally {
@@ -675,7 +694,7 @@ describe("disable-command-use / disable-agent-use flags", () => {
 			await writeSkill(
 				tempDir,
 				"dead-skill",
-				"name: dead-skill\ndescription: Nothing can reach this.\ndisable-command-use: true\ndisable-agent-use: true",
+				"name: dead-skill\ndescription: Nothing can reach this.\ndisable-command-use: true\ndisable-model-invocation: true",
 			);
 			const { warnings } = await loadSkills({ ...DISABLE_ALL_BUILTIN_SKILLS, customDirectories: [tempDir] });
 			const unusable = warnings.filter(w => w.kind === "unusable");
