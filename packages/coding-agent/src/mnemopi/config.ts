@@ -46,7 +46,9 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 	const cwd = settings.getCwd();
 	const scoping = settings.get("mnemopi.scoping");
 	const configuredBank = settings.get("mnemopi.bank");
-	const dbPath = configuredDbPath ?? path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
+	const dbPath = configuredDbPath?.trim()
+		? configuredDbPath
+		: path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
 	const scope = computeMnemopiBankScope(configuredBank, cwd, scoping, settings.get("workspace.identifier"));
 	const recallBanks =
 		scoping === "global"

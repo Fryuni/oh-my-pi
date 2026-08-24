@@ -128,12 +128,9 @@ describe("createSessionManager — shared-bucket local resume", () => {
 					workspaceIdentifierMode: "git-remote",
 				}),
 			);
-			expect(resolveSpy).toHaveBeenCalledWith(
-				sessionId.slice(0, 8),
-				launchProject,
-				undefined,
-				{ workspaceIdentifierMode: "git-remote" },
-			);
+			expect(resolveSpy).toHaveBeenCalledWith(sessionId.slice(0, 8), launchProject, undefined, {
+				workspaceIdentifierMode: "git-remote",
+			});
 		} finally {
 			await result.close();
 		}
@@ -278,7 +275,9 @@ describe("runRootCommand — cross-project --resume", () => {
 			"marketplace.autoUpdate": "off",
 			enabledModels: [{ paths: [resumedProject], models: ["model-resumed"] }],
 		});
-		const resolveModelScope = vi.spyOn(modelResolverModule, "resolveModelScope").mockResolvedValue([]);
+		const resolveModelScope = vi
+			.spyOn(modelResolverModule, "resolveModelScope")
+			.mockResolvedValue([{ model: { id: "model-resumed" } } as modelResolverModule.ScopedModel]);
 		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
 		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
 		parsed.noExtensions = true;

@@ -19,6 +19,7 @@ import {
 	cerebrasModelManagerOptions,
 	cloudflareAiGatewayModelManagerOptions,
 	coreWeaveModelManagerOptions,
+	deepinfraModelManagerOptions,
 	deepseekModelManagerOptions,
 	firepassModelManagerOptions,
 	fireworksModelManagerOptions,
@@ -149,6 +150,14 @@ export const CATALOG_PROVIDERS = [
 		envVars: ["CURSOR_ACCESS_TOKEN"],
 		createModelManagerOptions: (config: ModelManagerConfig) => cursorModelManagerOptions(config),
 		catalogDiscovery: { label: "Cursor", envVars: ["CURSOR_API_KEY"], oauthProvider: "cursor" },
+	},
+	{
+		id: "deepinfra",
+		defaultModel: "deepseek-ai/DeepSeek-V4-Flash-0731",
+		envVars: ["DEEPINFRA_API_KEY"],
+		createModelManagerOptions: (config: ModelManagerConfig) => deepinfraModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
+		catalogDiscovery: { label: "DeepInfra", allowUnauthenticated: true },
 	},
 	{
 		id: "deepseek",
@@ -474,6 +483,7 @@ export const CATALOG_PROVIDERS = [
 		defaultModel: "openai/gpt-oss-120b",
 		envVars: ["COREWEAVE_API_KEY", "WANDB_API_KEY"],
 		createModelManagerOptions: (config: ModelManagerConfig) => coreWeaveModelManagerOptions(config),
+		dynamicModelsAuthoritative: true,
 		catalogDiscovery: { label: "CoreWeave Serverless Inference" },
 	},
 	{

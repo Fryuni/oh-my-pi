@@ -198,7 +198,7 @@ export function computeDefaultSessionDir(
 	const identity = resolveWorkspaceStorageIdentity(resolvedCwd, mode, encodedDirName);
 	const sessionDir = path.join(sessionsRoot, identity.segment);
 	if (identity.mode === "path") {
-		migrateHomeSessionDirs(sessionsRoot)
+		migrateHomeSessionDirs(sessionsRoot);
 		migrateLegacyAbsoluteSessionDir(resolvedCwd, sessionDir, sessionsRoot);
 		migrateHashedSessionDir(hashedDirName, sessionDir, sessionsRoot);
 	}

@@ -18,10 +18,11 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
-import type { WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
 import type { StructuredSubagentSchemaMode } from "../task/types";
+import type { WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
+import type { CompactionMethod } from "./compaction-methods";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -75,6 +76,7 @@ import {
 	writeTerminalBreadcrumb,
 } from "./session-paths";
 import { prepareEntryForPersistence } from "./session-persistence";
+import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
@@ -87,6 +89,7 @@ import {
 	normalizeSessionWorkspace,
 	normalizeWorkspaceDirectory,
 } from "./session-workspace";
+import { recordSessionTitle } from "./title-index";
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
@@ -1315,7 +1318,13 @@ export class SessionManager {
 	 */
 	cloneCurrentSession(options?: { persist?: boolean }): SessionManager {
 		const persist = options?.persist ?? this.#persist;
-		const clone = new SessionManager(this.#cwd, this.#sessionDir, persist, this.#storage, this.#workspaceIdentifierMode);
+		const clone = new SessionManager(
+			this.#cwd,
+			this.#sessionDir,
+			persist,
+			this.#storage,
+			this.#workspaceIdentifierMode,
+		);
 		clone.#suppressBreadcrumb = true;
 		clone.restoreState(this.captureState());
 		if (!persist) {
@@ -1618,7 +1627,8 @@ export class SessionManager {
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<SessionManager> {
 		const sessionDir =
-			options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage, this.#workspaceIdentifierMode);
+			options?.sessionDir ??
+			SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage, this.#workspaceIdentifierMode);
 		const manager = new SessionManager(this.#cwd, sessionDir, true, storage, this.#workspaceIdentifierMode);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		manager.#resetToNewSession();
@@ -1960,6 +1970,21 @@ export class SessionManager {
 		return this.#sessionFile;
 	}
 
+	/**
+	 * Whether the current session has actually been materialized to durable
+	 * storage (the JSONL exists on disk / in the active storage backend).
+	 *
+	 * Session persistence is lazy: the file is only written once the history
+	 * contains an assistant message (or an explicit {@link ensureOnDisk}
+	 * caller forces it). Until then {@link getSessionFile} returns an allocated
+	 * path that leads nowhere, so a `--resume <id>` hint built from it would
+	 * always fail. Consumers that advertise a resume command must gate on this
+	 * (issue #8860).
+	 */
+	isSessionOnDisk(): boolean {
+		return !!this.#sessionFile && this.#storage.existsSync(this.#sessionFile);
+	}
+
 	getArtifactsDir(): string | null {
 		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager.dir;
 		return artifactsDirectoryFor(this.#sessionFile);
@@ -2099,6 +2124,11 @@ export class SessionManager {
 		this.#index.insert(entry);
 		this.#notifyEntryAppended(entry);
 		await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp });
+		// Keep the recent-sessions title index current so welcome-screen lookups
+		// never have to content-scan this session's file.
+		if (this.#persist && this.#storage instanceof FileSessionStorage) {
+			recordSessionTitle(this.#sessionId, title);
+		}
 
 		this.#notifySessionNameListeners();
 		return true;
@@ -2235,9 +2265,14 @@ export class SessionManager {
 		shortSummary: string | undefined,
 		firstKeptEntryId: string,
 		tokensBefore: number,
-		details?: T,
-		fromExtension?: boolean,
-		preserveData?: Record<string, unknown>,
+		options: {
+			details?: T;
+			fromExtension?: boolean;
+			preserveData?: Record<string, unknown>;
+			method?: CompactionMethod;
+			providerReplayThroughEntryId?: string;
+			tokensAfter?: number;
+		} = {},
 	): string {
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
@@ -2246,9 +2281,12 @@ export class SessionManager {
 			shortSummary,
 			firstKeptEntryId,
 			tokensBefore,
-			details,
-			fromExtension,
-			preserveData,
+			tokensAfter: options.tokensAfter,
+			method: options.method,
+			providerReplayThroughEntryId: options.providerReplayThroughEntryId,
+			details: options.details,
+			fromExtension: options.fromExtension,
+			preserveData: options.preserveData,
 		};
 		this.#recordEntry(entry);
 		return entry.id;
@@ -2923,12 +2961,14 @@ export class SessionManager {
 		mode: WorkspaceIdentifierMode = "path",
 	): Promise<SessionInfo[]> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode);
-		return listSessions(dir, storage);
+		const sessions = await listSessions(dir, storage);
+		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
 	}
 
-	/** List all sessions across all project directories. */
-	static listAll(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
-		return listAllSessions(storage);
+	/** List all sessions across all project directories, pinned sessions first. */
+	static async listAll(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
+		const sessions = await listAllSessions(storage);
+		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
 	}
 }
 

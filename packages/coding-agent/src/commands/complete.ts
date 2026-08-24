@@ -10,8 +10,8 @@
  */
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import { Command } from "@oh-my-pi/pi-utils/cli";
-import { Settings } from "../config/settings";
 import { completeHelp as commandHelp } from "../cli/command-help";
+import { Settings } from "../config/settings";
 import { SessionManager } from "../session/session-manager";
 
 export default class Complete extends Command {

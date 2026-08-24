@@ -9,7 +9,7 @@
 		"enabled": true,
 		"includes": ["**"],
 		"rules": {
-			"preset": "recommended",
+			"recommended": true,
 			"a11y": "off",
 			"correctness": {
 				"noUnusedImports": "error",
@@ -65,6 +65,8 @@
 			"!**/test-sessions.ts",
 			"!**/agent_pb.ts",
 			"!**/devin-gen/**/*",
+			"!packages/catalog/src/discovery/cursor-proto.ts",
+			"!packages/catalog/src/discovery/devin-proto.ts",
 			"!.worktrees/**/*",
 			"!.wt/**/*"
 		]
