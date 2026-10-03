@@ -1111,6 +1111,10 @@ function buildCodexCatalogModel(
 					...(canDisable ? { requiresEffort: false } : {}),
 				}
 			: undefined;
+	// A row whose advertised levels pi cannot send (only `ultra`) still reasons;
+	// Responses carries that without an effort, but Chat Completions would get
+	// an invented ladder that never reaches the wire.
+	const reasoning = thinking !== undefined || (entry.reasoning && api !== "openai-completions");
 	const contextWindow = entry.contextWindow ?? reference?.contextWindow ?? DISCOVERY_DEFAULT_CONTEXT_WINDOW;
 	return buildModel({
 		id: entry.slug,
@@ -1118,7 +1122,7 @@ function buildCodexCatalogModel(
 		api,
 		provider: providerConfig.provider,
 		baseUrl,
-		reasoning: effortWire ? thinking !== undefined : entry.reasoning,
+		reasoning,
 		thinking,
 		input: entry.input ?? reference?.input ?? ["text"],
 		// Gateway pricing is provider-specific; keep it local-unknown.

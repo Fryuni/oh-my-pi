@@ -2890,6 +2890,11 @@ describe("ModelRegistry runtime discovery", () => {
 							input_modalities: ["text"],
 						},
 						{ slug: "gateway-fixed", display_name: "Gateway Fixed (High)", supported_reasoning_levels: [] },
+						{
+							slug: "gateway-ultra",
+							display_name: "Gateway Ultra",
+							supported_reasoning_levels: [{ effort: "ultra" }],
+						},
 						{ slug: "gateway-image", display_name: "Gateway Image", visibility: "hide" },
 					],
 				});
@@ -2917,6 +2922,11 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(fixed?.reasoning).toBe(false);
 		expect(fixed?.thinking).toBeUndefined();
 		expect(fixed?.input).toEqual(["text"]);
+		// A model that reasons only at levels pi cannot send keeps its reasoning
+		// capability without an effort selector.
+		const ultra = registry.find("codex-gateway", "gateway-ultra");
+		expect(ultra?.reasoning).toBe(true);
+		expect(ultra?.thinking).toBeUndefined();
 		expect(registry.find("codex-gateway", "gateway-image")).toBeUndefined();
 	});
 
@@ -2945,6 +2955,7 @@ describe("ModelRegistry runtime discovery", () => {
 								default_reasoning_level: "medium",
 								supported_reasoning_levels: ["none", "low", "medium", "high"].map(effort => ({ effort })),
 							},
+							{ slug: "gateway-ultra", supported_reasoning_levels: [{ effort: "ultra" }] },
 						],
 					});
 				}
@@ -2977,6 +2988,8 @@ describe("ModelRegistry runtime discovery", () => {
 		}).result();
 		await streamSimple(model, context, { apiKey: "k", fetch: fetchMock, disableReasoning: true }).result();
 		expect(payloads.map(payload => payload.reasoning_effort)).toEqual(["medium", "none"]);
+		// Chat Completions gets no invented ladder for levels pi cannot send.
+		expect(registry.find("codex-gateway", "gateway-ultra")?.thinking).toBeUndefined();
 	});
 
 	test("openai-models-list discovery keeps the data list when a server's models array is not a Codex catalog", async () => {
