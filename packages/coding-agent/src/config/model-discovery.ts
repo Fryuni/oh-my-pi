@@ -941,14 +941,8 @@ export async function discoverOpenAIModelsList(
 		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
 		: await attempt(baseHeaders);
 	const references = getBundledModelReferenceIndex();
-	// Codex catalog rows carry `slug`; other `models` arrays (llama.cpp serves an
-	// Ollama-style one beside `data`) leave the plain list authoritative.
-	const codexCatalog =
-		catalogUrl !== undefined &&
-		Array.isArray(payload.models) &&
-		payload.models.some(row => isRecord(row) && typeof row.slug === "string")
-			? parseCodexModelCatalog({ models: payload.models })
-			: null;
+	const codexRows = catalogUrl === undefined ? undefined : findCodexCatalogRows(payload);
+	const codexCatalog = codexRows ? parseCodexModelCatalog({ models: codexRows }) : null;
 	if (codexCatalog) {
 		return codexCatalog.map(entry => buildCodexCatalogModel(entry, providerConfig, baseUrl, headers, references));
 	}
@@ -1066,6 +1060,25 @@ export async function discoverOpenAIModelsList(
 	return discovered;
 }
 
+/**
+ * Rows of a Codex model catalog, which carry `slug`. Only `models` arrays with
+ * such rows count, so other `models` arrays (llama.cpp serves an Ollama-style
+ * one beside `data`) leave the plain list authoritative. The legacy `data`
+ * envelope counts only when no row carries the `id` the plain list requires.
+ */
+function findCodexCatalogRows(payload: { models?: unknown; data?: unknown }): unknown[] | undefined {
+	const isCodexRow = (row: unknown) => isRecord(row) && typeof row.slug === "string";
+	if (Array.isArray(payload.models) && payload.models.some(isCodexRow)) return payload.models;
+	if (
+		Array.isArray(payload.data) &&
+		payload.data.some(isCodexRow) &&
+		!payload.data.some(row => isRecord(row) && typeof row.id === "string")
+	) {
+		return payload.data;
+	}
+	return undefined;
+}
+
 /** OpenAI wire APIs whose effort parameter carries a Codex catalog's advertised level strings verbatim. */
 const CODEX_CATALOG_EFFORT_APIS: ReadonlySet<Api> = new Set<Api>([
 	"openai-completions",
@@ -1112,9 +1125,8 @@ function buildCodexCatalogModel(
 				}
 			: undefined;
 	// A row whose advertised levels pi cannot send (only `ultra`) still reasons;
-	// Responses carries that without an effort, but Chat Completions would get
-	// an invented ladder that never reaches the wire.
-	const reasoning = thinking !== undefined || (entry.reasoning && api !== "openai-completions");
+	// with no reasoning-effort support, no effort ever reaches the gateway.
+	const reasoning = thinking !== undefined || entry.reasoning;
 	const contextWindow = entry.contextWindow ?? reference?.contextWindow ?? DISCOVERY_DEFAULT_CONTEXT_WINDOW;
 	return buildModel({
 		id: entry.slug,
@@ -1136,9 +1148,11 @@ function buildCodexCatalogModel(
 			supportsStore: false,
 			supportsDeveloperRole: false,
 			supportsReasoningEffort: thinking !== undefined,
+			// The catalog speaks the plain OpenAI reasoning dialect; id-based
+			// dialect detection must not add fields the gateway never advertised.
+			...(effortWire && reasoning ? { thinkingFormat: "openai" } : {}),
 			...(thinking
 				? {
-						thinkingFormat: "openai",
 						reasoningEffortMap: Object.fromEntries(efforts.map(effort => [effort, effort])),
 						...(canDisable ? { reasoningDisableMode: "none-effort" } : {}),
 					}

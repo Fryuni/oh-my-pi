@@ -2955,7 +2955,7 @@ describe("ModelRegistry runtime discovery", () => {
 								default_reasoning_level: "medium",
 								supported_reasoning_levels: ["none", "low", "medium", "high"].map(effort => ({ effort })),
 							},
-							{ slug: "gateway-ultra", supported_reasoning_levels: [{ effort: "ultra" }] },
+							{ slug: "qwen3.8-max", supported_reasoning_levels: [{ effort: "ultra" }] },
 						],
 					});
 				}
@@ -2988,8 +2988,15 @@ describe("ModelRegistry runtime discovery", () => {
 		}).result();
 		await streamSimple(model, context, { apiKey: "k", fetch: fetchMock, disableReasoning: true }).result();
 		expect(payloads.map(payload => payload.reasoning_effort)).toEqual(["medium", "none"]);
-		// Chat Completions gets no invented ladder for levels pi cannot send.
-		expect(registry.find("codex-gateway", "gateway-ultra")?.thinking).toBeUndefined();
+
+		// A model that reasons only at levels pi cannot send stays reasoning, but
+		// no effort or id-detected dialect field (Qwen `enable_thinking`) is sent.
+		const ultraOnly = registry.find("codex-gateway", "qwen3.8-max") as Model;
+		expect(ultraOnly.reasoning).toBe(true);
+		await streamSimple(ultraOnly, context, { apiKey: "k", fetch: fetchMock, reasoning: Effort.High }).result();
+		const ultraPayload = payloads[2];
+		expect(ultraPayload.reasoning_effort).toBeUndefined();
+		expect(ultraPayload.enable_thinking).toBeUndefined();
 	});
 
 	test("openai-models-list discovery keeps the data list when a server's models array is not a Codex catalog", async () => {
@@ -3017,6 +3024,37 @@ describe("ModelRegistry runtime discovery", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 		await registry.refresh();
 		expect(registry.find("llama-server", "qwen3-coder.gguf")).toBeDefined();
+	});
+
+	test("openai-models-list discovery reads a legacy Codex catalog served in the data envelope", async () => {
+		writeRawModelsJson({
+			"legacy-gateway": {
+				baseUrl: "http://127.0.0.1:9985/v1",
+				api: "openai-responses",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9985/v1/models?client_version=latest") {
+				return Response.json({
+					data: [
+						{
+							slug: "legacy-sol",
+							display_name: "Legacy Sol",
+							supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }],
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.find("legacy-gateway", "legacy-sol");
+		expect(model?.name).toBe("Legacy Sol");
+		expect(model?.thinking?.efforts).toEqual([Effort.Low, Effort.High]);
 	});
 
 	test("openai-models-list discovery falls back to the plain list when a gateway rejects client_version", async () => {

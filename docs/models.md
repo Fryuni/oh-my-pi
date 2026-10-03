@@ -431,7 +431,7 @@ OpenAI wire APIs (`openai-completions`, `openai-responses`, `openai-codex-respon
 `azure-openai-responses`), the advertised `supported_reasoning_levels` and
 `default_reasoning_level` become the model's thinking levels and default, sent on the wire exactly
 as advertised: levels with no pi equivalent (such as `ultra`) are dropped, an advertised `none`
-makes "off" send `none`, and a row with no level pi can send has no effort selector.
+makes "off" send `none`, and a reasoning row with no level pi can send never sends an effort.
 Other APIs keep their lineage thinking rules. Rows with `visibility: hide` are skipped. Servers that
 ignore the parameter keep the plain `{ "data": [...] }` list described above, including servers
 whose `models` array is not a Codex catalog (llama.cpp's sits beside `data`); a gateway that
