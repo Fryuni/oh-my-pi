@@ -302,7 +302,8 @@ export interface CodexCatalogEntry {
 	reasoningLevels: string[];
 	/** Advertised `default_reasoning_level`, lowercased. */
 	defaultReasoningLevel: string | undefined;
-	input: ("text" | "image")[];
+	/** Advertised `input_modalities`; `null` when the row reports no recognized modality. */
+	input: ("text" | "image")[] | null;
 	preferWebsockets: boolean;
 	useResponsesLite: boolean;
 	toolMode: boolean;
@@ -446,7 +447,8 @@ function buildNormalizedCodexModel(
 					}
 				: {}),
 			reasoning: parsed.reasoning,
-			input: parsed.input,
+			// codex-rs defaults unreported modalities to text + image.
+			input: parsed.input ?? ["text", "image"],
 			// Codex discovery omits pricing; documented subscription credit-equivalent
 			// rates are rule-owned (`providers/openai-codex.kdl`) and applied at build time.
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -482,9 +484,9 @@ function parseReasoningLevels(supportedReasoningLevels: unknown): string[] {
 	return levels;
 }
 
-function normalizeInputModalities(inputModalities: unknown): ("text" | "image")[] {
+function normalizeInputModalities(inputModalities: unknown): ("text" | "image")[] | null {
 	if (!Array.isArray(inputModalities)) {
-		return ["text", "image"];
+		return null;
 	}
 
 	const set = new Set<"text" | "image">();
@@ -496,7 +498,7 @@ function normalizeInputModalities(inputModalities: unknown): ("text" | "image")[
 	}
 
 	if (set.size === 0) {
-		return ["text", "image"];
+		return null;
 	}
 
 	const canonical: ("text" | "image")[] = ["text", "image"];

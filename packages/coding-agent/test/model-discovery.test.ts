@@ -2911,10 +2911,12 @@ describe("ModelRegistry runtime discovery", () => {
 		const flash = registry.find("codex-gateway", "gateway-flash");
 		expect(flash?.thinking?.efforts).toEqual([Effort.Minimal, Effort.High]);
 		expect(flash?.input).toEqual(["text"]);
-		// An empty ladder offers no effort selector instead of an invented one.
+		// An empty ladder offers no effort selector instead of an invented one,
+		// and unreported modalities stay text-only rather than assuming vision.
 		const fixed = registry.find("codex-gateway", "gateway-fixed");
 		expect(fixed?.reasoning).toBe(false);
 		expect(fixed?.thinking).toBeUndefined();
+		expect(fixed?.input).toEqual(["text"]);
 		expect(registry.find("codex-gateway", "gateway-image")).toBeUndefined();
 	});
 

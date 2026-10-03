@@ -1077,7 +1077,7 @@ const CODEX_CATALOG_EFFORT_APIS: ReadonlySet<Api> = new Set<Api>([
 /**
  * Map one Codex-catalog row to a custom-provider model. The gateway's catalog
  * is authoritative for the display name, limits, modalities, and reasoning
- * ladder; the bundled reference only fills limits the row omits.
+ * ladder; the bundled reference only fills limits and modalities the row omits.
  *
  * Strict gateways reject any effort outside a model's advertised levels, so on
  * OpenAI wires the ladder keeps only the advertised levels pi can select, in
@@ -1120,7 +1120,7 @@ function buildCodexCatalogModel(
 		baseUrl,
 		reasoning: effortWire ? thinking !== undefined : entry.reasoning,
 		thinking,
-		input: entry.input,
+		input: entry.input ?? reference?.input ?? ["text"],
 		// Gateway pricing is provider-specific; keep it local-unknown.
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow,
