@@ -4,6 +4,7 @@
 
 ### Added
 
+- Custom OpenAI providers (`discovery.type: openai-models-list`) now request `/models?client_version=latest`, so Codex-compatible gateways supply each model's display name, limits, and reasoning levels; on OpenAI APIs the thinking selector offers only the levels the gateway advertises
 - The `/models` Roles view shows which saved model preset is in effect, and Ctrl+←/→ (or `p`/`P` on the role rows, for macOS where Ctrl+←/→ switches Spaces) switches to the next or previous one, in Tern and text mode ([#14210](https://github.com/can1357/oh-my-pi/pull/14210) by [@H4vC](https://github.com/H4vC))
 
 ### Changed

@@ -3,8 +3,9 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { FetchImpl, Model } from "@oh-my-pi/pi-ai";
+import type { Context, FetchImpl, Model } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
@@ -240,7 +241,7 @@ describe("ModelRegistry runtime discovery", () => {
 		let modelListCalls = 0;
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:9992/v1/models") {
+			if (url === "http://127.0.0.1:9992/v1/models?client_version=latest") {
 				modelListCalls++;
 				started.resolve();
 				return promise;
@@ -277,11 +278,11 @@ describe("ModelRegistry runtime discovery", () => {
 		let newModelListCalls = 0;
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:9992/v1/models") {
+			if (url === "http://127.0.0.1:9992/v1/models?client_version=latest") {
 				oldStarted.resolve();
 				return oldResponse.promise;
 			}
-			if (url === "http://127.0.0.1:9991/v1/models") {
+			if (url === "http://127.0.0.1:9991/v1/models?client_version=latest") {
 				newModelListCalls++;
 				return Response.json({ data: [{ id: "new-model", context_length: 65_536 }] });
 			}
@@ -738,7 +739,7 @@ describe("ModelRegistry runtime discovery", () => {
 		const unexpectedUrls: string[] = [];
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:4893/v1/models") {
+			if (url === "http://127.0.0.1:4893/v1/models?client_version=latest") {
 				return Response.json({
 					data: [{ id: "configured-gemini-cli-model", context_length: 65_536 }],
 				});
@@ -2537,7 +2538,7 @@ describe("ModelRegistry runtime discovery", () => {
 		});
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:9999/v1/models") {
+			if (url === "http://127.0.0.1:9999/v1/models?client_version=latest") {
 				return new Response(
 					JSON.stringify({
 						data: [
@@ -2572,7 +2573,7 @@ describe("ModelRegistry runtime discovery", () => {
 		});
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:9994/v1/models") {
+			if (url === "http://127.0.0.1:9994/v1/models?client_version=latest") {
 				return new Response(
 					JSON.stringify({
 						data: [
@@ -2646,7 +2647,7 @@ describe("ModelRegistry runtime discovery", () => {
 		});
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:9997/v1/models") {
+			if (url === "http://127.0.0.1:9997/v1/models?client_version=latest") {
 				// Thin gateway payload: `{id, object, owned_by}` with no
 				// `context_length` / `max_model_len`. Without reference lookup
 				// every discovered model falls back to the 128K/33K default,
@@ -2695,7 +2696,7 @@ describe("ModelRegistry runtime discovery", () => {
 		});
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:9996/v1/models") {
+			if (url === "http://127.0.0.1:9996/v1/models?client_version=latest") {
 				// Custom virtual tier ids that are absent from the bundled
 				// catalog: their vision support can only come from the server row.
 				return new Response(
@@ -2737,7 +2738,7 @@ describe("ModelRegistry runtime discovery", () => {
 		});
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:9995/v1/models") {
+			if (url === "http://127.0.0.1:9995/v1/models?client_version=latest") {
 				return new Response(
 					JSON.stringify({
 						data: [
@@ -2811,7 +2812,7 @@ describe("ModelRegistry runtime discovery", () => {
 		});
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "https://api.opper.ai/v3/compat/models") {
+			if (url === "https://api.opper.ai/v3/compat/models?client_version=latest") {
 				return new Response(JSON.stringify({ data: [{ id: "opper-full-a" }, { id: "opper-full-b" }] }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
@@ -2842,7 +2843,7 @@ describe("ModelRegistry runtime discovery", () => {
 		});
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "https://api.opper.ai/v3/compat/models") {
+			if (url === "https://api.opper.ai/v3/compat/models?client_version=latest") {
 				return new Response(JSON.stringify({ data: [{ id: "opper-full-a" }] }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
@@ -2853,6 +2854,184 @@ describe("ModelRegistry runtime discovery", () => {
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 		await registry.refresh();
 		expect(registry.find("opper-test", "opper-full-a")?.baseUrl).toBe("https://api.opper.ai/v3/compat");
+	});
+
+	test("openai-models-list discovery reads gateway names and reasoning ladders from a Codex catalog", async () => {
+		writeRawModelsJson({
+			"codex-gateway": {
+				baseUrl: "http://127.0.0.1:9989",
+				api: "openai-responses",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9989/v1/models?client_version=latest") {
+				return Response.json({
+					models: [
+						{
+							slug: "gateway-sol",
+							display_name: "Gateway Sol",
+							context_window: 272_000,
+							max_context_window: 872_000,
+							max_tokens: 64_000,
+							default_reasoning_level: "low",
+							supported_reasoning_levels: ["low", "medium", "high", "xhigh", "max", "ultra"].map(effort => ({
+								effort,
+							})),
+							input_modalities: ["text", "image"],
+							visibility: "list",
+						},
+						{
+							slug: "gateway-flash",
+							display_name: "Gateway Flash",
+							supported_reasoning_levels: [{ effort: "high" }, { effort: "minimal" }],
+							input_modalities: ["text"],
+						},
+						{ slug: "gateway-fixed", display_name: "Gateway Fixed (High)", supported_reasoning_levels: [] },
+						{ slug: "gateway-image", display_name: "Gateway Image", visibility: "hide" },
+					],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		const sol = registry.find("codex-gateway", "gateway-sol");
+		expect(sol?.name).toBe("Gateway Sol");
+		// `ultra` has no pi effort, so it is never offered or sent.
+		expect(sol?.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max]);
+		expect(sol?.thinking?.defaultLevel).toBe(Effort.Low);
+		expect(sol?.contextWindow).toBe(272_000);
+		expect(sol?.maxContextWindow).toBe(872_000);
+		expect(sol?.maxTokens).toBe(64_000);
+		// Advertised order is normalized to the least → most intensive ladder.
+		const flash = registry.find("codex-gateway", "gateway-flash");
+		expect(flash?.thinking?.efforts).toEqual([Effort.Minimal, Effort.High]);
+		expect(flash?.input).toEqual(["text"]);
+		// An empty ladder offers no effort selector instead of an invented one.
+		const fixed = registry.find("codex-gateway", "gateway-fixed");
+		expect(fixed?.reasoning).toBe(false);
+		expect(fixed?.thinking).toBeUndefined();
+		expect(registry.find("codex-gateway", "gateway-image")).toBeUndefined();
+	});
+
+	test("Codex-catalog reasoning levels reach the wire verbatim despite class effort remaps", async () => {
+		// The kimi-k3 class rule remaps efforts (medium → high) and treats
+		// reasoning as mandatory; a gateway that advertises its own levels
+		// rejects anything else, and an advertised `none` makes "off" valid.
+		writeRawModelsJson({
+			"codex-gateway": {
+				baseUrl: "http://127.0.0.1:9988/v1",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const payloads: Record<string, unknown>[] = [];
+		const fetchMock: FetchImpl = Object.assign(
+			async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+				const url = String(input);
+				if (url === "http://127.0.0.1:9988/v1/models?client_version=latest") {
+					return Response.json({
+						models: [
+							{
+								slug: "kimi-k3",
+								display_name: "Kimi K3",
+								default_reasoning_level: "medium",
+								supported_reasoning_levels: ["none", "low", "medium", "high"].map(effort => ({ effort })),
+							},
+						],
+					});
+				}
+				if (url === "http://127.0.0.1:9988/v1/chat/completions") {
+					payloads.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+					const chunk = {
+						id: "gateway-test",
+						object: "chat.completion.chunk",
+						created: 0,
+						model: "kimi-k3",
+						choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }],
+					};
+					return new Response(`data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`, {
+						headers: { "content-type": "text/event-stream" },
+					});
+				}
+				throw new Error(`Unexpected URL: ${url}`);
+			},
+			{ preconnect: fetch.preconnect },
+		);
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		const model = registry.find("codex-gateway", "kimi-k3") as Model;
+		const context: Context = { messages: [{ role: "user", content: "hi", timestamp: 0 }] };
+
+		await streamSimple(model, context, {
+			apiKey: "k",
+			fetch: fetchMock,
+			reasoning: Effort.Medium,
+		}).result();
+		await streamSimple(model, context, { apiKey: "k", fetch: fetchMock, disableReasoning: true }).result();
+		expect(payloads.map(payload => payload.reasoning_effort)).toEqual(["medium", "none"]);
+	});
+
+	test("openai-models-list discovery keeps the data list when a server's models array is not a Codex catalog", async () => {
+		// llama-server ignores `client_version` and answers `/v1/models` with an
+		// Ollama-style `models` array next to the OpenAI `data` list.
+		writeRawModelsJson({
+			"llama-server": {
+				baseUrl: "http://127.0.0.1:9986/v1",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:9986/v1/models?client_version=latest") {
+				return Response.json({
+					models: [{ name: "qwen3-coder.gguf", model: "qwen3-coder.gguf", capabilities: ["completion"] }],
+					object: "list",
+					data: [{ id: "qwen3-coder.gguf", object: "model", owned_by: "llamacpp" }],
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		expect(registry.find("llama-server", "qwen3-coder.gguf")).toBeDefined();
+	});
+
+	test("openai-models-list discovery falls back to the plain list when a gateway rejects client_version", async () => {
+		writeRawModelsJson({
+			"strict-gateway": {
+				baseUrl: "http://127.0.0.1:9987",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const requested: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			requested.push(url);
+			if (url === "http://127.0.0.1:9987/v1/models?client_version=latest") {
+				return new Response("unknown query parameter", { status: 400 });
+			}
+			if (url === "http://127.0.0.1:9987/v1/models") {
+				return Response.json({ data: [{ id: "strict-model" }] });
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		expect(registry.find("strict-gateway", "strict-model")).toBeDefined();
+		expect(requested.filter(url => url.startsWith("http://127.0.0.1:9987/"))).toEqual([
+			"http://127.0.0.1:9987/v1/models?client_version=latest",
+			"http://127.0.0.1:9987/v1/models",
+		]);
 	});
 
 	test("lm-studio discovery keeps native VLM modalities over a thin OpenAI row", async () => {

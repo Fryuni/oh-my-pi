@@ -52,7 +52,7 @@ describe("issue #1528 discovery maxTokens default", () => {
 
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url !== "https://api.example.com/v1/models") {
+			if (url !== "https://api.example.com/v1/models?client_version=latest") {
 				throw new Error(`Unexpected URL: ${url}`);
 			}
 			return new Response(JSON.stringify({ data: [{ id: "vllm-lab-fork-a1" }] }), {
@@ -175,7 +175,7 @@ describe("issue #1528 discovery maxTokens default", () => {
 
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url !== "https://anthropic-reseller.example.com/v1/models") {
+			if (url !== "https://anthropic-reseller.example.com/v1/models?client_version=latest") {
 				throw new Error(`Unexpected URL: ${url}`);
 			}
 			return new Response(JSON.stringify({ data: [{ id: "claude-3-5-sonnet" }] }), {

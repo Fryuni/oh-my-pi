@@ -421,6 +421,21 @@ A row advertising only image output becomes an image-generation runner; embeddin
 becomes an embedding runner. Mixed outputs remain chat models. These runners are visible with
 `omp models --kind all`, not the default chat listing.
 
+`openai-models-list` asks for `{models URL}?client_version=latest`. Codex-compatible gateways
+answer that with their Codex model catalog (`{ "models": [{ "slug", "display_name", ... }] }`).
+When the response's `models` rows carry `slug`, the catalog is authoritative for each visible row:
+`display_name` becomes the model name, and `context_window`, `max_context_window`, `max_tokens`,
+`input_modalities`, and `priority` set limits, modalities, and picker order (missing limits still
+fall back to the bundled reference). On OpenAI wire APIs (`openai-completions`, `openai-responses`,
+`openai-codex-responses`, `azure-openai-responses`), the advertised `supported_reasoning_levels`
+and `default_reasoning_level` become the model's thinking levels and default, sent on the wire
+exactly as advertised: levels with no pi equivalent (such as `ultra`) are dropped, an advertised
+`none` makes "off" send `none`, and a row advertising neither levels nor a default has no effort
+selector. Other APIs keep their lineage thinking rules. Rows with `visibility: hide` are skipped.
+Servers that ignore the parameter keep the plain `{ "data": [...] }` list described above, including
+servers whose `models` array is not a Codex catalog (llama.cpp's sits beside `data`); a gateway that
+rejects the parameter with a non-auth error is retried once without it.
+
 ### Explicit provider discovery
 
 You can configure discovery yourself:

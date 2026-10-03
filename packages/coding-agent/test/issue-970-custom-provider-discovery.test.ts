@@ -105,7 +105,7 @@ describe("issue #970 custom provider discovery", () => {
 			init,
 		) => {
 			const url = String(input);
-			if (url !== "http://192.168.5.3:8085/v1/models") {
+			if (url !== "http://192.168.5.3:8085/v1/models?client_version=latest") {
 				throw new Error(`Unexpected URL: ${url}`);
 			}
 			const headers = init?.headers as Headers | Record<string, string> | undefined;
@@ -196,13 +196,13 @@ describe("issue #970 custom provider discovery", () => {
 
 		const fetchMock: (input: string | URL | Request) => Promise<Response> = async input => {
 			const url = String(input);
-			if (url === "http://192.168.5.3:8085/v1/models") {
+			if (url === "http://192.168.5.3:8085/v1/models?client_version=latest") {
 				return new Response(JSON.stringify({ data: [{ id: "vllm-lab-fork-flash", max_model_len: 262_144 }] }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
 				});
 			}
-			if (url === "http://192.168.5.4:8085/v1/models") {
+			if (url === "http://192.168.5.4:8085/v1/models?client_version=latest") {
 				return new Response(JSON.stringify({ data: [{ id: "vllm-lab-fork-long", context_length: "1048576" }] }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
@@ -268,7 +268,7 @@ describe("issue #970 custom provider discovery", () => {
 		const fetchMock: (input: string | URL | Request) => Promise<Response> = async input => {
 			const url = String(input);
 			calls.push(url);
-			if (url !== "http://192.168.5.3:8085/v1/models") {
+			if (url !== "http://192.168.5.3:8085/v1/models?client_version=latest") {
 				throw new Error(`Unexpected URL: ${url}`);
 			}
 			return new Response(JSON.stringify({ data: [{ id: "Fresh", max_model_len: 262_144 }] }), {
@@ -280,7 +280,7 @@ describe("issue #970 custom provider discovery", () => {
 		const registry = new ModelRegistryImpl(authStorage, modelsPath, { fetch: fetchMock });
 		await registry.refreshProvider("vllm-fast", "online-if-uncached");
 
-		expect(calls).toEqual(["http://192.168.5.3:8085/v1/models"]);
+		expect(calls).toEqual(["http://192.168.5.3:8085/v1/models?client_version=latest"]);
 		expect(registry.find("vllm-fast", "Fresh")?.contextWindow).toBe(262_144);
 		expect(registry.find("vllm-fast", "Stale")).toBeUndefined();
 	});
@@ -453,7 +453,7 @@ describe("issue #970 custom provider discovery", () => {
 			init,
 		) => {
 			const url = String(input);
-			if (url !== "http://192.168.5.3:8085/v1/models") {
+			if (url !== "http://192.168.5.3:8085/v1/models?client_version=latest") {
 				throw new Error(`Unexpected URL: ${url}`);
 			}
 			const headers = init?.headers as Headers | Record<string, string> | undefined;

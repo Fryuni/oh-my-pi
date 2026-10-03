@@ -9,9 +9,12 @@ import { type ApiKey, withAuth } from "@oh-my-pi/pi-ai/auth-retry";
 import { getAppleFoundationModelsAvailability } from "@oh-my-pi/pi-ai/providers/apple-foundation-models";
 import type { Api, FetchImpl, Model, RemoteCompactionConfig } from "@oh-my-pi/pi-ai/types";
 import { buildDiscoveredModel, buildModel } from "@oh-my-pi/pi-catalog/build";
+import { type CodexCatalogEntry, parseCodexModelCatalog } from "@oh-my-pi/pi-catalog/discovery/codex";
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import {
 	getBundledModelReferenceIndex,
 	inheritReferenceThinking,
+	type ModelReferenceIndex,
 	resolveModelReference,
 	stripBracketedModelIdAffixes,
 } from "@oh-my-pi/pi-catalog/identity";
@@ -23,7 +26,7 @@ import {
 	OPENAI_COMPAT_DISCOVERY_DEFAULT_MAX_TOKENS,
 	resolveLiteLLMApi,
 } from "@oh-my-pi/pi-catalog/provider-models/openai-compat";
-import type { KindApiKind, ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
+import type { KindApiKind, ModelSpec, OpenAICompat, ThinkingConfig } from "@oh-my-pi/pi-catalog/types";
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { ProviderDiscovery } from "./models-config-schema";
 
@@ -866,6 +869,12 @@ export async function discoverOpenAIModelsList(
 		? normalizeOpenAIModelsListBaseUrl(providerConfig.baseUrl)
 		: normalizeBareDiscoveryBaseUrl(providerConfig.baseUrl);
 	const modelsUrl = appendModelsPath(baseUrl);
+	// Custom OpenAI providers ask for the Codex model catalog first: Codex-
+	// compatible gateways answer `client_version=latest` with per-model display
+	// names and reasoning ladders, and plain OpenAI-compatible servers ignore
+	// the parameter. LM Studio and the LiteLLM fallback keep the bare list.
+	const catalogUrl =
+		providerConfig.discovery.type === "openai-models-list" ? withCodexClientVersion(modelsUrl) : undefined;
 
 	const baseHeaders: Record<string, string> = { ...providerConfig.headers };
 	let headers = baseHeaders;
@@ -889,15 +898,26 @@ export async function discoverOpenAIModelsList(
 				: Promise.resolve(null);
 		const [payload, nativeMetadata] = await Promise.all([
 			withTimeoutSignal(timeoutMs, async signal => {
-				const res = await ctx.fetch(modelsUrl, {
+				let requestUrl = catalogUrl ?? modelsUrl;
+				let res = await ctx.fetch(requestUrl, {
 					headers: h,
 					signal,
 				});
+				// A gateway that rejects the unknown query parameter still serves
+				// the plain list; auth rejections are definitive and propagate.
+				if (!res.ok && requestUrl !== modelsUrl && res.status !== 401 && res.status !== 403) {
+					requestUrl = modelsUrl;
+					res = await ctx.fetch(requestUrl, {
+						headers: h,
+						signal,
+					});
+				}
 				if (!res.ok) {
-					throw new DiscoveryHttpError(res.status, modelsUrl);
+					throw new DiscoveryHttpError(res.status, requestUrl);
 				}
 				headers = h;
 				return (await res.json()) as {
+					models?: unknown;
 					data?: Array<{
 						id?: string;
 						max_model_len?: unknown;
@@ -920,8 +940,19 @@ export async function discoverOpenAIModelsList(
 	const [payload, nativeMetadata] = apiKey
 		? await withAuth(apiKey, key => attempt({ ...baseHeaders, Authorization: `Bearer ${key}` }))
 		: await attempt(baseHeaders);
-	const models = payload.data ?? [];
 	const references = getBundledModelReferenceIndex();
+	// Codex catalog rows carry `slug`; other `models` arrays (llama.cpp serves an
+	// Ollama-style one beside `data`) leave the plain list authoritative.
+	const codexCatalog =
+		catalogUrl !== undefined &&
+		Array.isArray(payload.models) &&
+		payload.models.some(row => isRecord(row) && typeof row.slug === "string")
+			? parseCodexModelCatalog({ models: payload.models })
+			: null;
+	if (codexCatalog) {
+		return codexCatalog.map(entry => buildCodexCatalogModel(entry, providerConfig, baseUrl, headers, references));
+	}
+	const models = payload.data ?? [];
 	const discovered: Model<Api>[] = [];
 	for (const item of models) {
 		const id = item.id;
@@ -1033,6 +1064,83 @@ export async function discoverOpenAIModelsList(
 		);
 	}
 	return discovered;
+}
+
+/** OpenAI wire APIs whose effort parameter carries a Codex catalog's advertised level strings verbatim. */
+const CODEX_CATALOG_EFFORT_APIS: ReadonlySet<Api> = new Set<Api>([
+	"openai-completions",
+	"openai-responses",
+	"openai-codex-responses",
+	"azure-openai-responses",
+]);
+
+/**
+ * Map one Codex-catalog row to a custom-provider model. The gateway's catalog
+ * is authoritative for the display name, limits, modalities, and reasoning
+ * ladder; the bundled reference only fills limits the row omits.
+ *
+ * Strict gateways reject any effort outside a model's advertised levels, so on
+ * OpenAI wires the ladder keeps only the advertised levels pi can select, in
+ * canonical order, and pins an identity wire map that class-level effort remaps
+ * cannot rewrite. Levels pi has no effort for (`ultra`) are never sent; an
+ * advertised `none` lets "off" send `none` instead of the lowest level.
+ */
+function buildCodexCatalogModel(
+	entry: CodexCatalogEntry,
+	providerConfig: DiscoveryProviderConfig,
+	baseUrl: string,
+	headers: Record<string, string>,
+	references: ModelReferenceIndex,
+): Model<Api> {
+	const api = providerConfig.api;
+	const reference = resolveModelReference(entry.slug, references) as ModelSpec<Api> | undefined;
+	const effortWire = CODEX_CATALOG_EFFORT_APIS.has(api);
+	const advertised = new Set(entry.reasoningLevels);
+	if (entry.defaultReasoningLevel !== undefined) advertised.add(entry.defaultReasoningLevel);
+	const efforts = effortWire ? THINKING_EFFORTS.filter(effort => advertised.has(effort)) : [];
+	const defaultLevel = efforts.find(effort => effort === entry.defaultReasoningLevel);
+	const canDisable = advertised.has("none");
+	const thinking: ThinkingConfig | undefined =
+		efforts.length > 0
+			? {
+					mode: "effort",
+					efforts,
+					...(defaultLevel ? { defaultLevel } : {}),
+					// An advertised `none` overrides lineage rules that treat the
+					// model's reasoning as mandatory on other hosts.
+					...(canDisable ? { requiresEffort: false } : {}),
+				}
+			: undefined;
+	const contextWindow = entry.contextWindow ?? reference?.contextWindow ?? DISCOVERY_DEFAULT_CONTEXT_WINDOW;
+	return buildModel({
+		id: entry.slug,
+		name: entry.name,
+		api,
+		provider: providerConfig.provider,
+		baseUrl,
+		reasoning: effortWire ? thinking !== undefined : entry.reasoning,
+		thinking,
+		input: entry.input,
+		// Gateway pricing is provider-specific; keep it local-unknown.
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow,
+		...(entry.maxContextWindow !== null ? { maxContextWindow: entry.maxContextWindow } : {}),
+		maxTokens: Math.min(entry.maxTokens ?? reference?.maxTokens ?? discoveryDefaultMaxTokens(api), contextWindow),
+		...(entry.priority !== Number.MAX_SAFE_INTEGER ? { priority: entry.priority } : {}),
+		headers,
+		compat: {
+			supportsStore: false,
+			supportsDeveloperRole: false,
+			supportsReasoningEffort: thinking !== undefined,
+			...(thinking
+				? {
+						thinkingFormat: "openai",
+						reasoningEffortMap: Object.fromEntries(efforts.map(effort => [effort, effort])),
+						...(canDisable ? { reasoningDisableMode: "none-effort" } : {}),
+					}
+				: {}),
+		},
+	} as ModelSpec<Api>);
 }
 
 export async function discoverLiteLLMModels(
@@ -1277,6 +1385,21 @@ function appendModelsPath(baseUrl: string): string {
 		return url.toString();
 	} catch {
 		return `${baseUrl}/models`;
+	}
+}
+
+/**
+ * Request the Codex model catalog from a `/models` URL. `latest` asks a
+ * Codex-compatible gateway for its full catalog regardless of the minimum
+ * client version each model declares.
+ */
+function withCodexClientVersion(modelsUrl: string): string {
+	try {
+		const url = new URL(modelsUrl);
+		url.searchParams.set("client_version", "latest");
+		return url.toString();
+	} catch {
+		return modelsUrl;
 	}
 }
 

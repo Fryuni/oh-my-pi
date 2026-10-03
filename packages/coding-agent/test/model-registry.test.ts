@@ -895,7 +895,7 @@ describe("ModelRegistry", () => {
 						},
 					});
 				}
-				if (url === "https://proxy.example/v1/models") {
+				if (url === "https://proxy.example/v1/models?client_version=latest") {
 					return Response.json({ data: [{ id: "gpt-5.7-sol" }] });
 				}
 				throw new Error(`Unexpected URL: ${url}`);
@@ -1683,7 +1683,9 @@ describe("ModelRegistry", () => {
 						: {}),
 				},
 			});
-			const fetchMock = mockOpenAiCompatibleModels("https://proxy.example/v1/models", ["gpt-5"]);
+			const fetchMock = mockOpenAiCompatibleModels("https://proxy.example/v1/models?client_version=latest", [
+				"gpt-5",
+			]);
 			const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
 			if (materialized) registry.getAll();
 			if (scenario === "runtimeProvider") {
@@ -3174,7 +3176,7 @@ describe("ModelRegistry", () => {
 				{
 					seedCache: dbPath =>
 						writeModelCache(
-							"cached-compact-proxy:openai-models-list-context-v3",
+							"cached-compact-proxy:openai-models-list-context-v4",
 							Date.now(),
 							[
 								buildModel({
@@ -3257,11 +3259,11 @@ describe("ModelRegistry", () => {
 					},
 				},
 				{
-					// Row under the retired pre-modality namespace; the context-v3
-					// bump must orphan it instead of serving the stale text-only row.
+					// Row under the retired pre-Codex-catalog namespace; the context-v4
+					// bump must orphan it instead of serving a row with no advertised ladder.
 					seedCache: dbPath =>
 						writeModelCache(
-							"stale-openai-proxy:openai-models-list-context-v2",
+							"stale-openai-proxy:openai-models-list-context-v3",
 							Date.now(),
 							[
 								buildModel({
@@ -3327,9 +3329,9 @@ describe("ModelRegistry", () => {
 			expect(model?.provider).toBe("litellm-proxy");
 		});
 
-		test("ignores openai-models-list rows cached under the retired context-v2 namespace", () => {
-			// PR #7584 added server-advertised input-modality parsing; warm v2 rows
-			// pinned vision-capable ids at text-only and must not load.
+		test("ignores openai-models-list rows cached under the retired context-v3 namespace", () => {
+			// Codex-catalog discovery (`client_version=latest`) added gateway names and
+			// reasoning ladders; warm v3 rows carried neither and must not load.
 			expect(openaiModelsListStaleNamespaceCache.find("stale-openai-proxy", "stale-vlm")).toBeUndefined();
 			expect(getModelsForProvider(openaiModelsListStaleNamespaceCache, "stale-openai-proxy")).toHaveLength(0);
 		});

@@ -54,10 +54,10 @@ describe("issue #11820 prewalk into a models.yml discovery provider target", () 
 		return async input => {
 			const url = String(input);
 			requestedUrls.push(url);
-			if (url === `${baseUrl}/models`) {
+			if (url === `${baseUrl}/models?client_version=latest`) {
 				return Response.json({ data: models.map(id => ({ id })) });
 			}
-			if (url === `${unrelatedBaseUrl}/models`) {
+			if (url === `${unrelatedBaseUrl}/models?client_version=latest`) {
 				return Response.json({ data: [{ id: "unrelated-model" }] });
 			}
 			return new Response("not found", { status: 404 });
@@ -108,7 +108,7 @@ describe("issue #11820 prewalk into a models.yml discovery provider target", () 
 
 		expect(options.prewalk?.target.provider).toBe("my-provider");
 		expect(options.prewalk?.target.id).toBe("some-model");
-		expect(requestedUrls).not.toContain(`${unrelatedBaseUrl}/models`);
+		expect(requestedUrls).not.toContain(`${unrelatedBaseUrl}/models?client_version=latest`);
 	});
 
 	test("arms prewalk for an explicit --prewalk-into discovery selector", async () => {
@@ -125,7 +125,7 @@ describe("issue #11820 prewalk into a models.yml discovery provider target", () 
 
 		expect(options.prewalk?.target.provider).toBe("my-provider");
 		expect(options.prewalk?.target.id).toBe("some-model");
-		expect(requestedUrls).not.toContain(`${unrelatedBaseUrl}/models`);
+		expect(requestedUrls).not.toContain(`${unrelatedBaseUrl}/models?client_version=latest`);
 	});
 
 	test("checks an earlier discovery-backed fallback before a later static model", async () => {
@@ -146,8 +146,8 @@ describe("issue #11820 prewalk into a models.yml discovery provider target", () 
 
 		expect(options.prewalk?.target.provider).toBe("my-provider");
 		expect(options.prewalk?.target.id).toBe("some-model");
-		expect(requestedUrls).toContain(`${baseUrl}/models`);
-		expect(requestedUrls).not.toContain(`${unrelatedBaseUrl}/models`);
+		expect(requestedUrls).toContain(`${baseUrl}/models?client_version=latest`);
+		expect(requestedUrls).not.toContain(`${unrelatedBaseUrl}/models?client_version=latest`);
 	});
 
 	test("continues discovery through ordered fallback providers", async () => {
@@ -165,8 +165,8 @@ describe("issue #11820 prewalk into a models.yml discovery provider target", () 
 
 		expect(options.prewalk?.target.provider).toBe("unrelated-provider");
 		expect(options.prewalk?.target.id).toBe("unrelated-model");
-		expect(requestedUrls).toContain(`${baseUrl}/models`);
-		expect(requestedUrls).toContain(`${unrelatedBaseUrl}/models`);
+		expect(requestedUrls).toContain(`${baseUrl}/models?client_version=latest`);
+		expect(requestedUrls).toContain(`${unrelatedBaseUrl}/models?client_version=latest`);
 	});
 
 	test("does not probe discovery providers for an unqualified missing target", async () => {
