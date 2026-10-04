@@ -472,11 +472,16 @@ function parseReasoningLevels(supportedReasoningLevels: unknown): string[] {
 
 	const levels: string[] = [];
 	for (const level of supportedReasoningLevels) {
-		const parsedLevel = codexReasoningPresetSchema(level);
-		if (parsedLevel instanceof type.errors) {
-			continue;
+		// Presets are `{ effort, description }` records; some catalogs list bare strings.
+		let raw: unknown = level;
+		if (typeof level !== "string") {
+			const parsedLevel = codexReasoningPresetSchema(level);
+			if (parsedLevel instanceof type.errors) {
+				continue;
+			}
+			raw = parsedLevel.effort;
 		}
-		const effort = toNonEmptyString(parsedLevel.effort)?.toLowerCase();
+		const effort = toNonEmptyString(raw)?.toLowerCase();
 		if (effort && !levels.includes(effort)) {
 			levels.push(effort);
 		}

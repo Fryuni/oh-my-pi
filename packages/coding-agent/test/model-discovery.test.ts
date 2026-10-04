@@ -2886,7 +2886,8 @@ describe("ModelRegistry runtime discovery", () => {
 						{
 							slug: "gateway-flash",
 							display_name: "Gateway Flash",
-							supported_reasoning_levels: [{ effort: "high" }, { effort: "minimal" }],
+							// Bare-string presets are accepted alongside `{ effort }` records.
+							supported_reasoning_levels: ["high", "minimal"],
 							input_modalities: ["text"],
 						},
 						{ slug: "gateway-fixed", display_name: "Gateway Fixed (High)", supported_reasoning_levels: [] },
