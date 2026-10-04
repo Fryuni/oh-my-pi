@@ -62,6 +62,7 @@ const codexModelEntrySchema = type({
 	"display_name?": "unknown",
 	"context_window?": "unknown",
 	"max_context_window?": "unknown",
+	"max_tokens?": "unknown",
 	"default_reasoning_level?": "unknown",
 	"supported_reasoning_levels?": "unknown",
 	"input_modalities?": "unknown",
@@ -230,18 +231,9 @@ function normalizeCodexModels(
 	baseUrl: string,
 	accountId: string | undefined,
 ): ModelSpec<"openai-codex-responses">[] | null {
-	const parsedResponse = codexModelsResponseSchema(payload);
-	if (parsedResponse instanceof type.errors) {
+	const parsedEntries = parseCodexModelCatalog(payload);
+	if (parsedEntries === null) {
 		return null;
-	}
-
-	const entries = parsedResponse.models ?? parsedResponse.data ?? [];
-	const parsedEntries: ParsedCodexModelEntry[] = [];
-	for (const entry of entries) {
-		const parsed = parseCodexModelEntry(entry);
-		if (parsed) {
-			parsedEntries.push(parsed);
-		}
 	}
 
 	// A worker `-wm` slug gets an extra plain-id route only when the bundled
@@ -292,14 +284,26 @@ function plainCounterpartForWorkerSlug(slug: string, bundledCodexModelIds: Reado
 	return plain.length > 0 && bundledCodexModelIds.has(plain) ? plain : null;
 }
 
-interface ParsedCodexModelEntry {
+/** One visible row of a Codex-shaped model catalog (`GET /models?client_version=…`). */
+export interface CodexCatalogEntry {
 	slug: string;
 	cyberPrograms: string[] | undefined;
 	name: string;
 	contextWindow: number | null;
 	maxContextWindow: number | null;
+	/** Advertised `max_tokens` output cap; `null` when the row omits it. */
+	maxTokens: number | null;
 	reasoning: boolean;
-	input: ("text" | "image")[];
+	/**
+	 * Advertised `supported_reasoning_levels[].effort` values, lowercased and
+	 * deduplicated in advertised order. Kept verbatim (including `none` and
+	 * levels pi has no effort for): consumers decide which ones they can send.
+	 */
+	reasoningLevels: string[];
+	/** Advertised `default_reasoning_level`, lowercased. */
+	defaultReasoningLevel: string | undefined;
+	/** Advertised `input_modalities`; `null` when the row reports no recognized modality. */
+	input: ("text" | "image")[] | null;
 	preferWebsockets: boolean;
 	useResponsesLite: boolean;
 	toolMode: boolean;
@@ -308,7 +312,31 @@ interface ParsedCodexModelEntry {
 	serviceTiers: string[] | undefined;
 }
 
-function parseCodexModelEntry(entry: unknown): ParsedCodexModelEntry | null {
+/**
+ * Parse a Codex-shaped model catalog payload (`{ models: [...] }`, or the
+ * legacy `{ data: [...] }` envelope) into its visible rows, in payload order.
+ * Malformed, slug-less, and hidden rows are dropped.
+ *
+ * Returns `null` when the payload is not a model-catalog envelope.
+ */
+export function parseCodexModelCatalog(payload: unknown): CodexCatalogEntry[] | null {
+	const parsedResponse = codexModelsResponseSchema(payload);
+	if (parsedResponse instanceof type.errors) {
+		return null;
+	}
+
+	const entries = parsedResponse.models ?? parsedResponse.data ?? [];
+	const parsedEntries: CodexCatalogEntry[] = [];
+	for (const entry of entries) {
+		const parsed = parseCodexModelEntry(entry);
+		if (parsed) {
+			parsedEntries.push(parsed);
+		}
+	}
+	return parsedEntries;
+}
+
+function parseCodexModelEntry(entry: unknown): CodexCatalogEntry | null {
 	const parsedEntry = codexModelEntrySchema(entry);
 	if (parsedEntry instanceof type.errors) {
 		return null;
@@ -346,13 +374,20 @@ function parseCodexModelEntry(entry: unknown): ParsedCodexModelEntry | null {
 		}
 	}
 
+	const reasoningLevels = parseReasoningLevels(payload.supported_reasoning_levels);
+	const defaultReasoningLevel = toNonEmptyString(payload.default_reasoning_level)?.toLowerCase();
 	return {
 		slug,
 		cyberPrograms,
 		name: toNonEmptyString(payload.display_name) ?? slug,
 		contextWindow: toPositiveInt(payload.context_window),
 		maxContextWindow: toPositiveInt(payload.max_context_window),
-		reasoning: supportsReasoning(payload.default_reasoning_level, payload.supported_reasoning_levels),
+		maxTokens: toPositiveInt(payload.max_tokens),
+		reasoning:
+			(defaultReasoningLevel !== undefined && defaultReasoningLevel !== "none") ||
+			reasoningLevels.some(level => level !== "none"),
+		reasoningLevels,
+		defaultReasoningLevel,
 		input: normalizeInputModalities(payload.input_modalities),
 		preferWebsockets: toBoolean(payload.prefer_websockets) === true,
 		useResponsesLite: toBoolean(payload.use_responses_lite) === true,
@@ -370,7 +405,7 @@ function parseCodexModelEntry(entry: unknown): ParsedCodexModelEntry | null {
  * so both listings of a model report the same context window and pricing.
  */
 function buildNormalizedCodexModel(
-	parsed: ParsedCodexModelEntry,
+	parsed: CodexCatalogEntry,
 	slug: string,
 	canonicalSlug: string,
 	baseUrl: string,
@@ -412,7 +447,8 @@ function buildNormalizedCodexModel(
 					}
 				: {}),
 			reasoning: parsed.reasoning,
-			input: parsed.input,
+			// codex-rs defaults unreported modalities to text + image.
+			input: parsed.input ?? ["text", "image"],
 			// Codex discovery omits pricing; documented subscription credit-equivalent
 			// rates are rule-owned (`providers/openai-codex.kdl`) and applied at build time.
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -429,33 +465,33 @@ function buildNormalizedCodexModel(
 	};
 }
 
-function supportsReasoning(defaultReasoningLevel: unknown, supportedReasoningLevels: unknown): boolean {
-	const defaultLevel = toNonEmptyString(defaultReasoningLevel)?.toLowerCase();
-	if (defaultLevel && defaultLevel !== "none") {
-		return true;
-	}
-
+function parseReasoningLevels(supportedReasoningLevels: unknown): string[] {
 	if (!Array.isArray(supportedReasoningLevels)) {
-		return false;
+		return [];
 	}
 
+	const levels: string[] = [];
 	for (const level of supportedReasoningLevels) {
-		const parsedLevel = codexReasoningPresetSchema(level);
-		if (parsedLevel instanceof type.errors) {
-			continue;
+		// Presets are `{ effort, description }` records; some catalogs list bare strings.
+		let raw: unknown = level;
+		if (typeof level !== "string") {
+			const parsedLevel = codexReasoningPresetSchema(level);
+			if (parsedLevel instanceof type.errors) {
+				continue;
+			}
+			raw = parsedLevel.effort;
 		}
-		const effort = toNonEmptyString(parsedLevel.effort)?.toLowerCase();
-		if (effort && effort !== "none") {
-			return true;
+		const effort = toNonEmptyString(raw)?.toLowerCase();
+		if (effort && !levels.includes(effort)) {
+			levels.push(effort);
 		}
 	}
-
-	return false;
+	return levels;
 }
 
-function normalizeInputModalities(inputModalities: unknown): ("text" | "image")[] {
+function normalizeInputModalities(inputModalities: unknown): ("text" | "image")[] | null {
 	if (!Array.isArray(inputModalities)) {
-		return ["text", "image"];
+		return null;
 	}
 
 	const set = new Set<"text" | "image">();
@@ -467,7 +503,7 @@ function normalizeInputModalities(inputModalities: unknown): ("text" | "image")[
 	}
 
 	if (set.size === 0) {
-		return ["text", "image"];
+		return null;
 	}
 
 	const canonical: ("text" | "image")[] = ["text", "image"];

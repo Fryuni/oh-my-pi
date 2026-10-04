@@ -695,7 +695,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		let modelListCalls = 0;
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:9995/v1/models") {
+			if (url === "http://127.0.0.1:9995/v1/models?client_version=latest") {
 				modelListCalls++;
 				return Response.json({ data: [{ id: "dynamic-model", context_length: 65_536 }] });
 			}
@@ -1531,11 +1531,11 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		let otherListCalls = 0;
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:9994/v1/models") {
+			if (url === "http://127.0.0.1:9994/v1/models?client_version=latest") {
 				modelListCalls++;
 				return Response.json({ data: [{ id: "dynamic-model", context_length: 65_536 }] });
 			}
-			if (url === "http://127.0.0.1:9993/v1/models") {
+			if (url === "http://127.0.0.1:9993/v1/models?client_version=latest") {
 				otherListCalls++;
 				return Response.json({ data: [{ id: "other-model", context_length: 65_536 }] });
 			}

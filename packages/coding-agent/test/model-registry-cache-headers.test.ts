@@ -105,7 +105,7 @@ describe("startup model cache header restoration (#5780)", () => {
 		);
 		const primedRegistry = new ModelRegistry(authStorage, modelsPath, {
 			fetch: async (input, init) => {
-				expect(String(input)).toBe("https://example.invalid/v1/models");
+				expect(String(input)).toBe("https://example.invalid/v1/models?client_version=latest");
 				expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer test-key");
 				return Response.json({ data: [{ id: "probe-model" }] });
 			},

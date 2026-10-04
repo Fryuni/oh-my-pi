@@ -365,7 +365,7 @@ describe("ModelRegistry runtime provider registration", () => {
 		);
 		const configuredFetch: FetchImpl = async input => {
 			const url = String(input);
-			if (url === "http://127.0.0.1:4893/v1/models") {
+			if (url === "http://127.0.0.1:4893/v1/models?client_version=latest") {
 				return Response.json({
 					data: [{ id: "shared-runtime-model", context_length: 32_768 }],
 				});

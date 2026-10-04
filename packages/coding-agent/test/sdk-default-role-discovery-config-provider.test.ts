@@ -53,7 +53,7 @@ describe("issue #6162 fresh launch default role from models.yml discovery provid
 	function mockDiscovery(models: string[]): FetchImpl {
 		return async input => {
 			const url = String(input);
-			if (url === `${baseUrl}/models`) {
+			if (url === `${baseUrl}/models?client_version=latest`) {
 				return Response.json({ data: models.map(id => ({ id })) });
 			}
 			return new Response("not found", { status: 404 });
